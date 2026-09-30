@@ -33,6 +33,11 @@ tasks:
     cmds:
       - go test {{.MODULE_PATTERNS}}
 
+  test:taskfile:
+    desc: 驗證 Taskfile 的 container CLI 偵測（stub CLI，不啟動容器）
+    cmds:
+      - test/taskfile_container_cli_test.sh
+
   vet:
     desc: 跑 go.work 內所有 module 的 go vet
     cmds:
