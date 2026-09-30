@@ -47,8 +47,8 @@ func runDevice(c context.Context, cfg mqttx.Config, interval time.Duration) {
 	client := mqtt.NewClient(cfg.ClientOptions().
 		SetConnectRetry(true).
 		SetConnectRetryInterval(time.Second))
-	if tok := client.Connect(); tok.Wait() && tok.Error() != nil {
-		log.Printf("%s: connect %s: %v", id, cfg.BrokerURL, tok.Error())
+	if err := mqttx.Connect(c, client); err != nil {
+		log.Printf("%s: %s: %v", id, cfg.BrokerURL, err)
 		return
 	}
 	log.Printf("%s: connected to %s", id, cfg.BrokerURL)

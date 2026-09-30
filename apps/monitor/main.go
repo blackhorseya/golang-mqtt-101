@@ -43,8 +43,9 @@ func main() {
 			log.Printf("subscribed to %s", *filter)
 		})
 	client := mqtt.NewClient(opts)
-	if tok := client.Connect(); tok.Wait() && tok.Error() != nil {
-		log.Fatalf("connect %s: %v", cfg.BrokerURL, tok.Error())
+	if err := mqttx.Connect(c, client); err != nil {
+		log.Printf("%s: %v", cfg.BrokerURL, err)
+		return
 	}
 	log.Printf("connected to %s as %s", cfg.BrokerURL, cfg.ClientID)
 
