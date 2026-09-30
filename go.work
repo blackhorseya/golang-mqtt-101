@@ -1,6 +1,8 @@
 go 1.27.1
 
 use (
+	./apps/device
 	./apps/hello
+	./apps/monitor
 	./pkg/mqttx
 )
