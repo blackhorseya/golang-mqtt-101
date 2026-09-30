@@ -42,6 +42,13 @@ tasks:
     cmds:
       - test/taskfile_container_cli_test.sh
 
+  test:integration:
+    desc: 起 broker 跑對真實 mosquitto 的整合測試，結束後關閉 broker
+    cmds:
+      - task: broker:up
+      - defer: { task: broker:down }
+      - MQTT_INTEGRATION=1 go test -count=1 -run Integration {{.MODULE_PATTERNS}}
+
   vet:
     desc: 跑 go.work 內所有 module 的 go vet
     cmds:
