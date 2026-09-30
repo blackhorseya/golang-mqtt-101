@@ -1,0 +1,49 @@
+version: '3'
+
+vars:
+  APPS:
+    sh: ls apps
+  # go.work 內各 module 的目錄 pattern，例如 ./apps/hello/...
+  MODULE_PATTERNS:
+    sh: find apps pkg -name go.mod -exec dirname {} \; | sed 's|^|./|; s|$|/...|' | tr '\n' ' '
+  COMPOSE: docker compose -f deployments/docker/docker-compose.yaml
+
+tasks:
+  default:
+    cmds:
+      - task --list
+
+  build:
+    desc: 編譯所有 app 到 ./bin/
+    cmds:
+      - for: { var: APPS }
+        task: build:app
+        vars:
+          APP: '{{.ITEM}}'
+
+  build:app:
+    desc: 編譯單一 app（task build:app APP=hello）
+    requires:
+      vars: [APP]
+    cmds:
+      - go build -o bin/{{.APP}} ./apps/{{.APP}}
+
+  test:
+    desc: 跑 go.work 內所有 module 的測試
+    cmds:
+      - go test {{.MODULE_PATTERNS}}
+
+  vet:
+    desc: 跑 go.work 內所有 module 的 go vet
+    cmds:
+      - go vet {{.MODULE_PATTERNS}}
+
+  broker:up:
+    desc: 啟動本機 mosquitto
+    cmds:
+      - '{{.COMPOSE}} up -d'
+
+  broker:down:
+    desc: 停止本機 mosquitto
+    cmds:
+      - '{{.COMPOSE}} down'
