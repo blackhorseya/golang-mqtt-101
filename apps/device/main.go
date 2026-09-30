@@ -1,6 +1,7 @@
-// device 模擬多個 IoT device：每個 device 是一個獨立的 MQTT client，定期發送 telemetry。
+// device 模擬多個 IoT device：每個 device 是一個獨立的 MQTT client，
+// 連上後宣告 online、定期發送 telemetry，並在連線時設定 LWT。
 //
-//	device --count 10 --interval 1s
+//	device --count 10 --interval 1s --keepalive 10s
 package main
 
 import (
@@ -19,13 +20,20 @@ import (
 	"github.com/blackhorseya/golang-mqtt-101/pkg/mqttx"
 )
 
-// Phase 1 固定用 QoS 0（at most once）；Phase 4 才開放設定。
-const telemetryQoS = 0
+const (
+	// QoS 目前固定為 0（at most once）；Phase 4 才開放設定。
+	telemetryQoS = 0
+	statusQoS    = 0
+
+	// 對 broker 的單次操作最多等多久；斷線時不能無限等下去。
+	brokerTimeout = 2 * time.Second
+)
 
 func main() {
 	cfg := mqttx.ConfigFromEnv("")
 	count := flag.Int("count", 1, "要模擬的 device 數量")
 	interval := flag.Duration("interval", 2*time.Second, "每個 device 發送 telemetry 的間隔")
+	keepAlive := flag.Duration("keepalive", 10*time.Second, "MQTT keep alive；broker 超過 1.5 倍時間沒收到封包就判定斷線並發布 LWT")
 	flag.StringVar(&cfg.BrokerURL, "broker", cfg.BrokerURL, "broker URL（預設讀 MQTT_BROKER_URL）")
 	flag.Parse()
 
@@ -36,17 +44,33 @@ func main() {
 	for n := 1; n <= *count; n++ {
 		devCfg := cfg
 		devCfg.ClientID = mqttx.DeviceID(n)
-		wg.Go(func() { runDevice(c, devCfg, *interval) })
+		wg.Go(func() { runDevice(c, deviceOptions(devCfg, *keepAlive), devCfg, *interval) })
 	}
 	wg.Wait()
 }
 
-// runDevice 連上 broker 後每隔 interval 發一次 telemetry，直到 c 被取消才正常斷線。
-func runDevice(c context.Context, cfg mqttx.Config, interval time.Duration) {
+// deviceOptions 建立 device 的連線選項。
+//
+// LWT（Last Will and Testament）在 CONNECT 時就交給 broker 保管：
+// 若 device 沒送 DISCONNECT 就斷線（process 被 kill、網路中斷、keep alive 逾時），
+// broker 會代為發布這則訊息；正常 DISCONNECT 時 broker 則丟棄它。
+func deviceOptions(cfg mqttx.Config, keepAlive time.Duration) *mqtt.ClientOptions {
 	id := cfg.ClientID
-	client := mqtt.NewClient(cfg.ClientOptions().
+	return cfg.ClientOptions().
+		SetKeepAlive(keepAlive).
+		SetBinaryWill(mqttx.StatusTopic(id), statusPayload(mqttx.StateOffline, mqttx.ReasonLWT), statusQoS, false).
 		SetConnectRetry(true).
-		SetConnectRetryInterval(time.Second))
+		SetConnectRetryInterval(time.Second).
+		// 每次連上（包含自動重連）都重新宣告 online
+		SetOnConnectHandler(func(client mqtt.Client) {
+			publishStatus(context.Background(), client, id, mqttx.StateOnline, mqttx.ReasonConnected)
+		})
+}
+
+// runDevice 連上 broker 後每隔 interval 發一次 telemetry，直到 c 被取消才正常下線。
+func runDevice(c context.Context, opts *mqtt.ClientOptions, cfg mqttx.Config, interval time.Duration) {
+	id := cfg.ClientID
+	client := mqtt.NewClient(opts)
 	if err := mqttx.Connect(c, client); err != nil {
 		log.Printf("%s: %s: %v", id, cfg.BrokerURL, err)
 		return
@@ -62,7 +86,9 @@ func runDevice(c context.Context, cfg mqttx.Config, interval time.Duration) {
 	for {
 		select {
 		case <-c.Done():
-			// 正常斷線：送出 DISCONNECT 封包，broker 知道這是主動離開
+			// 正常下線：先自己宣告 offline，再送 DISCONNECT（broker 因此不會發布 LWT）。
+			// 此時 c 已取消，所以用新的 context；broker 不在時最多等 brokerTimeout。
+			publishStatus(context.Background(), client, id, mqttx.StateOffline, mqttx.ReasonGraceful)
 			client.Disconnect(250)
 			log.Printf("%s: disconnected, published %d telemetry", id, published)
 			return
@@ -73,11 +99,26 @@ func runDevice(c context.Context, cfg mqttx.Config, interval time.Duration) {
 				continue
 			}
 			// QoS 0 的 token 在送進網路層後就完成，不代表 broker 或任何 subscriber 收到了
-			if tok := client.Publish(topic, telemetryQoS, false, payload); tok.Wait() && tok.Error() != nil {
-				log.Printf("%s: publish %s: %v", id, topic, tok.Error())
+			if err := mqttx.Wait(c, client.Publish(topic, telemetryQoS, false, payload), brokerTimeout); err != nil {
+				log.Printf("%s: publish %s: %v", id, topic, err)
 				continue
 			}
 			published++
 		}
 	}
+}
+
+func publishStatus(c context.Context, client mqtt.Client, id string, state mqttx.State, reason mqttx.Reason) {
+	tok := client.Publish(mqttx.StatusTopic(id), statusQoS, false, statusPayload(state, reason))
+	if err := mqttx.Wait(c, tok, brokerTimeout); err != nil {
+		log.Printf("%s: publish status %s: %v", id, state, err)
+		return
+	}
+	log.Printf("%s: status %s (%s)", id, state, reason)
+}
+
+func statusPayload(state mqttx.State, reason mqttx.Reason) []byte {
+	// Status 只有兩個 string 欄位，json.Marshal 不會失敗
+	b, _ := mqttx.EncodeStatus(mqttx.Status{State: state, Reason: reason})
+	return b
 }
