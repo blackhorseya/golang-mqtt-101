@@ -6,7 +6,11 @@ vars:
   # go.work 內各 module 的目錄 pattern，例如 ./apps/hello/...
   MODULE_PATTERNS:
     sh: find apps pkg -name go.mod -exec dirname {} \; | sed 's|^|./|; s|$|/...|' | tr '\n' ' '
-  COMPOSE: docker compose -f deployments/docker/docker-compose.yaml
+  # container CLI：優先用環境變數 CONTAINER_CLI，否則自動偵測 docker → podman。
+  # 不能靠 shell alias（如 alias docker=podman），task 的內建 shell 不會載入 alias。
+  CONTAINER_CLI:
+    sh: echo "${CONTAINER_CLI:-$(command -v docker || command -v podman || echo docker)}"
+  COMPOSE: '{{.CONTAINER_CLI}} compose -f deployments/docker/docker-compose.yaml'
 
 tasks:
   default:
