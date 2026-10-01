@@ -11,9 +11,9 @@ import (
 //	devices/{deviceID}/status
 const devicesRoot = "devices"
 
-// DeviceID 產生模擬 device 的 ID，例如 1 → device-001。
-func DeviceID(n int) string {
-	return fmt.Sprintf("device-%03d", n)
+// DeviceID 產生模擬 device 的 ID，例如 ("device", 1) → device-001。
+func DeviceID(prefix string, n int) string {
+	return fmt.Sprintf("%s-%03d", prefix, n)
 }
 
 // TelemetryTopic 回傳 device 發送 telemetry 的 topic。
