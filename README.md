@@ -17,9 +17,10 @@ go.work          把以上 module 串成一個 workspace
 
 ```
 devices/{deviceID}/telemetry     device → monitor，量測資料（JSON）
+devices/{deviceID}/status        device 在線狀態：{"state":"online|offline","reason":"connected|graceful|lwt"}
 ```
 
-後續 phase 會加入 `devices/{deviceID}/status` 與 `commands/{deviceID}/{command}`。
+後續 phase 會加入 `commands/{deviceID}/{command}`。
 
 ## 快速開始
 
@@ -39,6 +40,9 @@ task build && ./bin/monitor
 monitor 會印出：
 
 ```
+device-001  status=online  reason=connected  online=1
+device-002  status=online  reason=connected  online=2
+device-003  status=online  reason=connected  online=3
 device-001  temp=28.4  humidity=61  battery=82
 device-002  temp=27.1  humidity=58  battery=91
 device-003  temp=29.2  humidity=64  battery=73
@@ -53,7 +57,8 @@ device-003  temp=29.2  humidity=64  battery=73
 | broker | `--broker` | `MQTT_BROKER_URL` | `tcp://localhost:1883` |
 | device 數量 | `--count` | | `1` |
 | 發送間隔 | `--interval` | | `2s` |
-| monitor 訂閱 | `--topic` | | `devices/+/telemetry` |
+| keep alive | `--keepalive` | | `10s` |
+| monitor 訂閱（逗號分隔） | `--topic` | | `devices/+/telemetry,devices/+/status` |
 
 ## Phase 1 練習：Pub/Sub 與 wildcard
 
@@ -77,6 +82,51 @@ broker 會把訊息複製給每個符合的訂閱，publisher 不知道也不在
 
 先啟動 device，過幾秒再啟動 monitor。monitor 收不到啟動前發的 telemetry：
 QoS 0 且非 retained 的訊息，broker 轉發給當下的訂閱者後就丟棄了。
+
+## Phase 2 練習：Device 狀態與 LWT
+
+device 連上時發 `online`；正常結束前自己發 `offline reason=graceful` 再送 DISCONNECT。
+連線時還會先把一則 **Last Will**（`offline reason=lwt`）交給 broker 保管：
+device 沒送 DISCONNECT 就消失時，由 broker 代發。monitor 從 `reason` 看得出是哪一種。
+
+先開 monitor，再用 `./bin/device --count 1 --keepalive 5s` 啟動一個 device，然後分別試：
+
+**練習 4：正常下線（Ctrl+C）**
+
+```
+device-001  status=offline  reason=graceful  online=0
+```
+
+之後不會再出現 `reason=lwt`：broker 收到 DISCONNECT 就把 Last Will 丟掉了。
+
+**練習 5：異常斷線（kill -9）**
+
+```sh
+kill -9 $(pgrep -x device)
+```
+
+```
+device-001  status=offline  reason=lwt  online=0
+```
+
+process 來不及送任何東西，但 OS 關閉了 TCP 連線，broker 立刻發現並發布 Last Will。
+
+**練習 6：Keep Alive（kill -STOP）**
+
+```sh
+kill -STOP $(pgrep -x device)   # 暫停 process：連線還在，但不再有任何封包
+# 等約 7.5 秒（keepalive 5s × 1.5）
+kill -CONT $(pgrep -x device)   # 恢復
+```
+
+暫停期間 TCP 連線沒斷，broker 只能靠 keep alive 判斷：超過 1.5 倍 keepalive 沒收到封包才判定斷線並發布 `reason=lwt`。
+恢復後 device 自動重連，又出現 `status=online`。把 `--keepalive` 改成 30s 再試一次，比較 LWT 出現的時間。
+這就是 keep alive 存在的原因：網路靜默中斷（拔網路線、NAT 逾時）時，沒有人會通知 broker。
+
+**練習 7：晚到的 monitor**
+
+先啟動 device，再啟動 monitor。monitor 只看得到 telemetry，看不到任何 status，`online=` 計數也對不上：
+status 訊息只送給當下的訂閱者。Phase 3 會用 retained message 解決這個問題。
 
 ## 測試
 

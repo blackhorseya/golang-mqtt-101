@@ -42,7 +42,7 @@ func TestIntegrationWildcards(t *testing.T) {
 		want   []string
 	}{
 		{filter: "devices/+/telemetry", want: []string{TelemetryTopic(deviceID)}},
-		{filter: "devices/#", want: []string{"devices/" + deviceID + "/status", TelemetryTopic(deviceID)}},
+		{filter: "devices/#", want: []string{StatusTopic(deviceID), TelemetryTopic(deviceID)}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.filter, func(t *testing.T) {
@@ -64,7 +64,11 @@ func TestIntegrationWildcards(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			pub.Publish("devices/"+deviceID+"/status", 0, false, "online").WaitTimeout(5 * time.Second)
+			status, err := EncodeStatus(Status{State: StateOnline, Reason: ReasonConnected})
+			if err != nil {
+				t.Fatal(err)
+			}
+			pub.Publish(StatusTopic(deviceID), 0, false, status).WaitTimeout(5 * time.Second)
 			pub.Publish(TelemetryTopic(deviceID), 0, false, payload).WaitTimeout(5 * time.Second)
 
 			// telemetry 一定最後到（同一 client 的訊息依序轉發），收到它就代表不會再有 status

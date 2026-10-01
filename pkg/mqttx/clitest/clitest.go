@@ -2,6 +2,7 @@
 package clitest
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -32,8 +33,17 @@ func UnreachableBroker(t *testing.T) string {
 	return "tcp://" + addr
 }
 
-// ExitsOnInterrupt 啟動 binary，等 startup 後送 SIGINT，並要求它在 within 內結束。
-func ExitsOnInterrupt(t *testing.T, bin string, startup, within time.Duration, args ...string) {
+// Process 是一個由測試啟動的 app process。
+type Process struct {
+	t    *testing.T
+	name string
+	cmd  *exec.Cmd
+	out  *lockedBuffer
+	done chan struct{} // process 結束時 close，可重複讀取
+}
+
+// Start 啟動 binary；測試結束時若還在跑會被 kill。
+func Start(t *testing.T, bin string, args ...string) *Process {
 	t.Helper()
 	cmd := exec.Command(bin, args...)
 	out := &lockedBuffer{}
@@ -41,18 +51,50 @@ func ExitsOnInterrupt(t *testing.T, bin string, startup, within time.Duration, a
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	p := &Process{t: t, name: fmt.Sprintf("%s %v", filepath.Base(bin), args), cmd: cmd, out: out, done: make(chan struct{})}
+	go func() {
+		cmd.Wait()
+		close(p.done)
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-p.done:
+		default:
+			cmd.Process.Kill()
+			<-p.done
+		}
+	})
+	return p
+}
 
-	time.Sleep(startup)
-	if err := cmd.Process.Signal(os.Interrupt); err != nil {
-		t.Fatalf("send SIGINT: %v", err)
+// Signal 送出 signal（例如 os.Interrupt、syscall.SIGKILL）。
+func (x *Process) Signal(sig os.Signal) {
+	x.t.Helper()
+	if err := x.cmd.Process.Signal(sig); err != nil {
+		x.t.Fatalf("signal %v to %s: %v", sig, x.name, err)
 	}
+}
+
+// WaitExit 要求 process 在 within 內結束。
+func (x *Process) WaitExit(within time.Duration) {
+	x.t.Helper()
 	select {
-	case <-done:
+	case <-x.done:
 	case <-time.After(within):
-		cmd.Process.Kill()
-		<-done
-		t.Fatalf("%s %v still running %s after SIGINT\noutput:\n%s", filepath.Base(bin), args, within, out.String())
+		x.t.Fatalf("%s still running after %s\noutput:\n%s", x.name, within, x.out.String())
 	}
+}
+
+// Output 回傳目前為止 stdout + stderr 的內容。
+func (x *Process) Output() string {
+	return x.out.String()
+}
+
+// ExitsOnInterrupt 啟動 binary，等 startup 後送 SIGINT，並要求它在 within 內結束。
+func ExitsOnInterrupt(t *testing.T, bin string, startup, within time.Duration, args ...string) {
+	t.Helper()
+	p := Start(t, bin, args...)
+	time.Sleep(startup)
+	p.Signal(os.Interrupt)
+	p.WaitExit(within)
 }
