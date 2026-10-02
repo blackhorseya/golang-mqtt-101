@@ -233,3 +233,55 @@ func TestIntegrationInterruptAfterBrokerLost(t *testing.T) {
 	p.Signal(os.Interrupt)
 	p.WaitExit(5 * time.Second)
 }
+
+// subscribeTelemetry 以指定 QoS 訂閱這組 device 的 telemetry，回傳每則訊息實際送達的 QoS。
+func (x *fleet) subscribeTelemetry(name string, qos byte) <-chan byte {
+	x.t.Helper()
+	got := make(chan byte, 64)
+	cfg := mqttx.ConfigFromEnv(x.prefix + "-" + name)
+	client := mqtt.NewClient(cfg.ClientOptions().SetConnectRetry(true).SetConnectRetryInterval(200 * time.Millisecond))
+	if tok := client.Connect(); !tok.WaitTimeout(10*time.Second) || tok.Error() != nil {
+		x.t.Fatalf("connect %s: %v", name, tok.Error())
+	}
+	x.t.Cleanup(func() { client.Disconnect(250) })
+	tok := client.Subscribe("devices/+/telemetry", qos, func(_ mqtt.Client, m mqtt.Message) {
+		if id, err := mqttx.DeviceIDFromTopic(m.Topic()); err == nil && strings.HasPrefix(id, x.prefix+"-") {
+			got <- m.Qos()
+		}
+	})
+	if !tok.WaitTimeout(5*time.Second) || tok.Error() != nil {
+		x.t.Fatalf("subscribe %s: %v", name, tok.Error())
+	}
+	return got
+}
+
+// 實際送達的 QoS = min(發布的 QoS, 訂閱的 QoS)：訂閱的 QoS 是上限，不會把訊息升級。
+func TestIntegrationEffectiveQoS(t *testing.T) {
+	cases := []struct {
+		publish, subscribe, want byte
+	}{
+		{publish: 0, subscribe: 2, want: 0},
+		{publish: 1, subscribe: 2, want: 1},
+		{publish: 2, subscribe: 2, want: 2},
+		{publish: 2, subscribe: 1, want: 1},
+		{publish: 2, subscribe: 0, want: 0},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("publish%d_subscribe%d", tc.publish, tc.subscribe), func(t *testing.T) {
+			f := newFleet(t, 1)
+			got := f.subscribeTelemetry("tel", tc.subscribe)
+			p := f.start("--qos", fmt.Sprint(tc.publish))
+
+			select {
+			case qos := <-got:
+				if qos != tc.want {
+					t.Errorf("delivered QoS = %d, want %d", qos, tc.want)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("timeout waiting for telemetry")
+			}
+			p.Signal(os.Interrupt)
+			p.WaitExit(5 * time.Second)
+		})
+	}
+}

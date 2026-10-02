@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -12,4 +13,17 @@ func TestInterruptWhileBrokerUnavailable(t *testing.T) {
 	bin := clitest.Build(t, "monitor")
 	clitest.ExitsOnInterrupt(t, bin, time.Second, 3*time.Second,
 		"--broker", clitest.UnreachableBroker(t))
+}
+
+// QoS 只有 0、1、2；不合法的值要在連線前就失敗。
+func TestInvalidQoSExits(t *testing.T) {
+	p := clitest.Start(t, clitest.Build(t, "monitor"), "--qos", "3", "--broker", clitest.UnreachableBroker(t))
+	p.WaitExit(3 * time.Second)
+	if code := p.ExitCode(); code == 0 {
+		t.Errorf("exit code = 0, want non-zero\noutput:\n%s", p.Output())
+	}
+	// 必須是 QoS 檢查擋下的，而不是例如「flag 未定義」之類的其他錯誤
+	if out := p.Output(); !strings.Contains(out, "must be 0, 1 or 2") {
+		t.Errorf("output does not explain the valid QoS values:\n%s", out)
+	}
 }
