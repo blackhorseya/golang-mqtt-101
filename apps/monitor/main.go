@@ -43,7 +43,7 @@ func main() {
 	c, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	h := &handler{presence: presence{}, stats: &receiveStats{}}
+	h := &handler{presence: presence{}, seq: newSeqTracker(), stats: &receiveStats{}}
 	opts := cfg.ClientOptions().
 		SetConnectRetry(true).
 		SetConnectRetryInterval(time.Second).
@@ -82,10 +82,11 @@ func main() {
 	log.Printf("stats: %s", h.stats.summary())
 }
 
-// handler 處理收到的訊息並維護 device 在線狀態。
+// handler 處理收到的訊息，維護 device 在線狀態與序號。
 type handler struct {
 	mu       sync.Mutex
 	presence presence
+	seq      *seqTracker
 	stats    *receiveStats
 }
 
@@ -100,8 +101,12 @@ func (h *handler) handle(_ mqtt.Client, m mqtt.Message) {
 		}
 		// 端到端延遲：device 產生 telemetry 到 monitor 收到（同一台機器，時鐘一致）
 		latency := time.Since(t.Timestamp)
-		h.stats.record(m.Qos(), m.Duplicate(), latency)
-		fmt.Println(formatTelemetry(t, m.Qos(), m.Duplicate(), latency))
+		// 應用層 idempotency：依序號決定這筆要不要處理（duplicate、out-of-order 不處理）
+		h.mu.Lock()
+		v, missing := h.seq.observe(t.DeviceID, t.Run, t.Seq)
+		h.mu.Unlock()
+		h.stats.record(m.Qos(), m.Duplicate(), latency, v, missing)
+		fmt.Println(formatTelemetry(t, m.Qos(), m.Duplicate(), latency, v, missing))
 	case strings.HasSuffix(m.Topic(), "/status"):
 		id, err := mqttx.DeviceIDFromTopic(m.Topic())
 		if err != nil {

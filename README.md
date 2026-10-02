@@ -43,9 +43,9 @@ monitor 會印出：
 device-001  status=online  reason=connected  online=1
 device-002  status=online  reason=connected  online=2
 device-003  status=online  reason=connected  online=3
-device-001  temp=28.4  humidity=61  battery=82  qos=0  lat=0.6ms
-device-002  temp=27.1  humidity=58  battery=91  qos=0  lat=0.5ms
-device-003  temp=29.2  humidity=64  battery=73  qos=0  lat=0.7ms
+device-001  temp=28.4  humidity=61  battery=82  seq=1  qos=0  lat=0.6ms  accepted
+device-002  temp=27.1  humidity=58  battery=91  seq=1  qos=0  lat=0.5ms  accepted
+device-003  temp=29.2  humidity=64  battery=73  seq=1  qos=0  lat=0.7ms  accepted
 ```
 
 `Ctrl+C` 停止；用完 `task broker:down`。
@@ -64,6 +64,8 @@ device-003  temp=29.2  humidity=64  battery=73  qos=0  lat=0.7ms
 | telemetry QoS | `--qos`（device） | | `0` |
 | 訂閱 QoS 上限 | `--qos`（monitor） | | `2` |
 | 統計回報間隔 | `--report`（兩者皆有） | | `5s` |
+| 應用層重送機率 | `--dup-rate`（device） | | `0` |
+| 跳號（送出前遺失）機率 | `--skip-rate`（device） | | `0` |
 | monitor 訂閱（逗號分隔） | `--topic` | | `devices/+/telemetry,devices/+/status` |
 
 ## Phase 1 練習：Pub/Sub 與 wildcard
@@ -258,6 +260,69 @@ QoS 只保證「一段連線、一次 session 內」不重複：publisher ↔ br
 > 這個 phase 只看「正常連線」下的 QoS 差異。
 > 斷線時的行為差異（QoS 0 在重連期間直接丟棄、QoS 1/2 先存起來重連後再送）要等 Phase 6 有了斷線工具再觀察。
 > 本機沒有網路問題，`dup` 幾乎不會出現。
+
+## Phase 5 練習：序號與 Idempotency
+
+每筆 telemetry 帶兩個欄位：
+
+- `seq`：每個 device 從 1 開始、每筆 +1 的序號
+- `run`：device 這次 process 的識別（啟動時間）。device 重啟後 `seq` 從 1 重來，`run` 也會不同
+
+monitor 對每個 device 只記住 `(run, 上一個處理過的 seq)`，據此判斷每筆：
+
+| 判斷 | 條件 | 處理嗎 |
+|------|------|--------|
+| `accepted` | seq = last + 1（或第一次看到這個 device / 換了 run） | 是 |
+| `gap(missing=N)` | seq > last + 1，中間 N 筆遺失 | 是 |
+| `duplicate` | seq = last | 否 |
+| `out-of-order` | seq < last | 否 |
+
+這就是應用層的 idempotency：同一筆資料收到幾次都只處理一次。統計中的 `duplicate` 是應用層依序號看到的重複，
+`dup` 則是 MQTT 協定層的 DUP flag，兩者不同。
+
+**練習 14：QoS 2 也擋不住的重複**
+
+```sh
+./bin/monitor
+./bin/device --qos 2 --dup-rate 0.3
+```
+
+```
+device-001  ...  seq=7  qos=2  lat=4.1ms  accepted
+device-001  ...  seq=7  qos=2  lat=4.3ms  duplicate
+```
+
+`--dup-rate` 模擬應用程式自己重送（例如等不到回應就再發一次）：對 MQTT 來說這是一則全新的訊息，
+QoS 2 的交握照樣完成、broker 照樣轉發。結束時比較 device 的 `retries` 與 monitor 的 `duplicate`，兩者相同（本機實測都是 38）。
+
+**練習 15：gap**
+
+```sh
+./bin/device --skip-rate 0.2
+```
+
+`--skip-rate` 讓序號用掉但不發出（模擬送出前就遺失）。monitor 看到 `gap(missing=N)`。
+
+比較 device 的 `skipped` 與 monitor 的 `missing`，`missing` 通常會**少一點**（本機實測 23 vs 21）：
+只有被前後兩筆夾住的遺失才看得出來。device 的第一筆就被跳過時，monitor 從第二筆開始算；
+最後幾筆被跳過時，後面沒有訊息可以讓 monitor 發現 —— 序號只能偵測「之後有人來」的遺失。
+Phase 6 斷線時用 QoS 0 會看到真正的遺失。
+
+**練習 16：device 重啟**
+
+device 跑一陣子後 Ctrl+C 再啟動：monitor 看到 `seq=1 ... accepted`，而不是一路 `out-of-order`。
+如果只記序號、不記 `run`，重啟後的每一筆都會比舊的 last 小，直到追上為止都會被丟掉。
+
+**練習 17：晚到的 monitor**
+
+先啟動 device，過一陣子再啟動 monitor：第一筆可能是 `seq=57`，直接 `accepted`，不算 gap ——
+monitor 不知道之前發生什麼，只能從它看到的第一筆開始算。
+
+**只記一個數字的限制**
+
+- MQTT 對同一個 publisher、同一個 topic 保證順序，所以本機幾乎看不到 `out-of-order`
+- 一則很晚才到的舊訊息，和一則重複的舊訊息，都會落在 `out-of-order`，分不出來
+- 要分得出來就得記住處理過的序號集合（例如滑動視窗），那已經是「複雜的去重系統」了 —— 這個 repo 刻意不做
 
 ## 測試
 

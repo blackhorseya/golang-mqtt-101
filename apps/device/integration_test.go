@@ -285,3 +285,61 @@ func TestIntegrationEffectiveQoS(t *testing.T) {
 		})
 	}
 }
+
+// startMonitor 啟動 monitor binary，只訂閱這組 device 的 telemetry。
+func (x *fleet) startMonitor() *clitest.Process {
+	x.t.Helper()
+	bin := clitest.BuildDir(x.t, "monitor", "../monitor")
+	p := clitest.Start(x.t, bin, "--topic", "devices/"+x.devices[0]+"/telemetry", "--report", "0")
+	p.WaitOutput("subscribed to", 10*time.Second)
+	return p
+}
+
+// 應用層重送（--dup-rate 1：每筆 telemetry 都再發一次）是新的 MQTT 訊息，
+// 即使用 QoS 2，broker 也照樣轉發兩次 —— 只有 monitor 依序號判斷才擋得住。
+func TestIntegrationDuplicateSurvivesQoS2(t *testing.T) {
+	f := newFleet(t, 1)
+	m := f.startMonitor()
+
+	p := f.start("--qos", "2", "--dup-rate", "1")
+	// 重送是在原本那則確認之後才發，所以要等第二份到了才能中斷 device
+	m.WaitCount("seq=1  qos=2", 2, 10*time.Second)
+	m.WaitCount("seq=2  qos=2", 2, 10*time.Second)
+	p.Signal(os.Interrupt)
+	p.WaitExit(5 * time.Second)
+
+	// 每個 seq 的兩份裡，第一份被接受、第二份被判為重複
+	out := m.Output()
+	for _, seq := range []string{"seq=1  qos=2", "seq=2  qos=2"} {
+		var verdicts []string
+		for line := range strings.SplitSeq(out, "\n") {
+			if strings.Contains(line, seq) {
+				verdicts = append(verdicts, line[strings.LastIndex(line, "  ")+2:])
+			}
+		}
+		if len(verdicts) < 2 || verdicts[0] != "accepted" || verdicts[1] != "duplicate" {
+			t.Errorf("%s verdicts = %q, want [accepted duplicate ...]\n%s", seq, verdicts, out)
+		}
+	}
+}
+
+// device 重啟後序號從 1 重來；run 不同，monitor 要當成新的序列，而不是一路判成 out-of-order。
+func TestIntegrationRestartedDeviceStartsNewSequence(t *testing.T) {
+	f := newFleet(t, 1)
+	m := f.startMonitor()
+
+	first := f.start()
+	m.WaitOutput("seq=3", 10*time.Second)
+	first.Signal(syscall.SIGKILL)
+	first.WaitExit(3 * time.Second)
+
+	second := f.start()
+	// 第一次執行與重啟後各出現一次 seq=2
+	m.WaitCount("seq=2  ", 2, 10*time.Second)
+	second.Signal(os.Interrupt)
+	second.WaitExit(5 * time.Second)
+
+	if out := m.Output(); strings.Contains(out, "out-of-order") || strings.Contains(out, "duplicate") {
+		t.Errorf("restart was misclassified\n%s", out)
+	}
+}

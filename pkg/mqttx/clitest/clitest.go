@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -14,8 +15,14 @@ import (
 // Build 把目前目錄的 main package 編譯到暫存目錄並回傳 binary 路徑。
 func Build(t *testing.T, name string) string {
 	t.Helper()
+	return BuildDir(t, name, ".")
+}
+
+// BuildDir 把 dir 的 main package 編譯到暫存目錄並回傳 binary 路徑。
+func BuildDir(t *testing.T, name, dir string) string {
+	t.Helper()
 	bin := filepath.Join(t.TempDir(), name)
-	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+	if out, err := exec.Command("go", "build", "-o", bin, dir).CombinedOutput(); err != nil {
 		t.Fatalf("go build %s: %v\n%s", name, err, out)
 	}
 	return bin
@@ -108,5 +115,24 @@ func (x *Process) ExitCode() int {
 	default:
 		x.t.Fatalf("%s has not exited", x.name)
 		return -1
+	}
+}
+
+// WaitOutput 等到輸出中出現 substr，timeout 就失敗。
+func (x *Process) WaitOutput(substr string, timeout time.Duration) {
+	x.t.Helper()
+	x.WaitCount(substr, 1, timeout)
+}
+
+// WaitCount 等到輸出中 substr 出現至少 n 次，timeout 就失敗。
+func (x *Process) WaitCount(substr string, n int, timeout time.Duration) {
+	x.t.Helper()
+	deadline := time.Now().Add(timeout)
+	for strings.Count(x.out.String(), substr) < n {
+		if time.Now().After(deadline) {
+			x.t.Fatalf("%s: %q appeared %d times (want %d) after %s\noutput:\n%s",
+				x.name, substr, strings.Count(x.out.String(), substr), n, timeout, x.out.String())
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
