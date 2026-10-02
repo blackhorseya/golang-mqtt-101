@@ -2,6 +2,7 @@
 // 連上後宣告 online（retained）、定期發送 telemetry，並在連線時設定 LWT。
 //
 //	device --count 10 --interval 1s --keepalive 10s --qos 1
+//	device --qos 2 --dup-rate 0.2        # 20% 的 telemetry 由應用程式再發一次
 //	device --count 10 --clear-retained   # 清除這些 device 留在 broker 上的 retained status
 package main
 
@@ -40,10 +41,20 @@ func main() {
 	clearOnly := flag.Bool("clear-retained", false, "不啟動 device，改為清除這些 device 的 retained status 後結束")
 	qosFlag := flag.Int("qos", 0, "telemetry 的 QoS（0、1、2）")
 	report := flag.Duration("report", 5*time.Second, "每隔多久印一次發布統計（0 表示只在結束時印）")
+	dupFlag := flag.Float64("dup-rate", 0, "每筆 telemetry 由應用程式再發一次的機率（0–1），模擬應用層重送")
+	skipFlag := flag.Float64("skip-rate", 0, "每筆 telemetry 用掉序號但不發出的機率（0–1），模擬送出前遺失")
 	flag.StringVar(&cfg.BrokerURL, "broker", cfg.BrokerURL, "broker URL（預設讀 MQTT_BROKER_URL）")
 	flag.Parse()
 
 	qos, err := mqttx.ParseQoS(*qosFlag)
+	if err != nil {
+		log.Fatal(err)
+	}
+	dupRate, err := parseRate("dup-rate", *dupFlag)
+	if err != nil {
+		log.Fatal(err)
+	}
+	skipRate, err := parseRate("skip-rate", *skipFlag)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -58,7 +69,17 @@ func main() {
 		return
 	}
 
-	sim := &simulator{interval: *interval, qos: qos, retain: *retain, stats: &publishStats{}, traffic: &mqttx.Traffic{}}
+	sim := &simulator{
+		interval: *interval,
+		qos:      qos,
+		retain:   *retain,
+		dupRate:  dupRate,
+		skipRate: skipRate,
+		// 這次 process 的識別；device 重啟後序號從 1 重來，subscriber 靠 run 不同分辨
+		run:     time.Now().UnixNano(),
+		stats:   &publishStats{},
+		traffic: &mqttx.Traffic{},
+	}
 	stopReport := sim.reportEvery(*report)
 
 	var wg sync.WaitGroup
@@ -73,11 +94,22 @@ func main() {
 	log.Printf("stats (qos %d): %s", qos, sim.summary())
 }
 
+// parseRate 檢查機率是否在 [0, 1]。
+func parseRate(name string, v float64) (float64, error) {
+	if v < 0 || v > 1 {
+		return 0, fmt.Errorf("parse %s %g: must be between 0 and 1", name, v)
+	}
+	return v, nil
+}
+
 // simulator 是所有 device 共用的設定與統計。
 type simulator struct {
 	interval time.Duration
 	qos      byte
 	retain   bool
+	dupRate  float64
+	skipRate float64
+	run      int64
 	stats    *publishStats
 	traffic  *mqttx.Traffic
 }
@@ -142,7 +174,8 @@ func (s *simulator) runDevice(c context.Context, opts *mqtt.ClientOptions, cfg m
 	}
 	log.Printf("%s: connected to %s", id, cfg.BrokerURL)
 
-	sensor := newSensor(id, rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())))
+	sensor := newSensor(id, s.run, rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())))
+	rng := rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))
 	topic := mqttx.TelemetryTopic(id)
 	published := 0
 
@@ -158,22 +191,42 @@ func (s *simulator) runDevice(c context.Context, opts *mqtt.ClientOptions, cfg m
 			log.Printf("%s: disconnected, published %d telemetry", id, published)
 			return
 		case now := <-ticker.C:
-			payload, err := mqttx.EncodeTelemetry(sensor.next(now))
+			tel := sensor.next(now)
+			if rng.Float64() < s.skipRate {
+				// 序號已經用掉，但這筆從來沒送出：subscriber 會看到 gap
+				s.stats.recordSkip()
+				continue
+			}
+			payload, err := mqttx.EncodeTelemetry(tel)
 			if err != nil {
 				log.Printf("%s: %v", id, err)
 				continue
 			}
-			// token 完成的時機取決於 QoS：0 是寫進網路層、1 是收到 PUBACK、2 是收到 PUBCOMP
-			start := time.Now()
-			err = mqttx.Wait(c, client.Publish(topic, s.qos, false, payload), brokerTimeout)
-			s.stats.record(time.Since(start), err)
-			if err != nil {
-				log.Printf("%s: publish %s: %v", id, topic, err)
-				continue
+			if s.publish(c, client, topic, payload, false) {
+				published++
 			}
-			published++
+			if rng.Float64() < s.dupRate {
+				// 應用層重送：同一筆 payload（同一個 seq）再發一次。對 MQTT 來說這是一則全新的訊息，
+				// 即使 QoS 2 也擋不住 —— 只有 subscriber 依序號判斷才能發現
+				if s.publish(c, client, topic, payload, true) {
+					published++
+				}
+			}
 		}
 	}
+}
+
+// publish 發布一則 telemetry 並記錄統計，回傳是否在期限內得到確認。
+func (s *simulator) publish(c context.Context, client mqtt.Client, topic string, payload []byte, retry bool) bool {
+	// token 完成的時機取決於 QoS：0 是寫進網路層、1 是收到 PUBACK、2 是收到 PUBCOMP
+	start := time.Now()
+	err := mqttx.Wait(c, client.Publish(topic, s.qos, false, payload), brokerTimeout)
+	s.stats.record(time.Since(start), err, retry)
+	if err != nil {
+		log.Printf("%s: publish: %v", topic, err)
+		return false
+	}
+	return true
 }
 
 func publishStatus(c context.Context, client mqtt.Client, id string, state mqttx.State, reason mqttx.Reason, retain bool) {
