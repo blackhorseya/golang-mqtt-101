@@ -27,3 +27,18 @@ func TestInvalidQoSExits(t *testing.T) {
 		t.Errorf("output does not explain the valid QoS values:\n%s", out)
 	}
 }
+
+// --dup-rate / --skip-rate 是機率，必須在 [0, 1]。
+func TestInvalidRateExits(t *testing.T) {
+	bin := clitest.Build(t, "device")
+	for _, args := range [][]string{{"--dup-rate", "1.5"}, {"--skip-rate", "-0.1"}} {
+		p := clitest.Start(t, bin, append(args, "--broker", clitest.UnreachableBroker(t))...)
+		p.WaitExit(3 * time.Second)
+		if code := p.ExitCode(); code == 0 {
+			t.Errorf("%v: exit code = 0, want non-zero", args)
+		}
+		if out := p.Output(); !strings.Contains(out, "must be between 0 and 1") {
+			t.Errorf("%v: output does not explain the valid range:\n%s", args, out)
+		}
+	}
+}

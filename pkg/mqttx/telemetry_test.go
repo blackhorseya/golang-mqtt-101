@@ -8,6 +8,8 @@ import (
 func TestTelemetryRoundTrip(t *testing.T) {
 	in := Telemetry{
 		DeviceID:  "device-001",
+		Run:       1790900000000000000,
+		Seq:       101,
 		Temp:      28.4,
 		Humidity:  61,
 		Battery:   82,
