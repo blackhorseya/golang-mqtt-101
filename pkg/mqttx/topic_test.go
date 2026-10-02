@@ -3,10 +3,19 @@ package mqttx
 import "testing"
 
 func TestDeviceID(t *testing.T) {
-	cases := map[int]string{1: "device-001", 42: "device-042", 1000: "device-1000"}
-	for n, want := range cases {
-		if got := DeviceID(n); got != want {
-			t.Errorf("DeviceID(%d) = %q, want %q", n, got, want)
+	cases := []struct {
+		prefix string
+		n      int
+		want   string
+	}{
+		{"device", 1, "device-001"},
+		{"device", 42, "device-042"},
+		{"device", 1000, "device-1000"},
+		{"it123", 2, "it123-002"},
+	}
+	for _, tc := range cases {
+		if got := DeviceID(tc.prefix, tc.n); got != tc.want {
+			t.Errorf("DeviceID(%q, %d) = %q, want %q", tc.prefix, tc.n, got, tc.want)
 		}
 	}
 }

@@ -82,6 +82,14 @@ func (h *handler) handle(_ mqtt.Client, m mqtt.Message) {
 			log.Printf("%v", err)
 			return
 		}
+		// 空 payload 的 retained publish 代表清除保留訊息
+		if len(m.Payload()) == 0 {
+			h.mu.Lock()
+			online := h.presence.remove(id)
+			h.mu.Unlock()
+			fmt.Println(formatCleared(id, online))
+			return
+		}
 		s, err := mqttx.DecodeStatus(m.Payload())
 		if err != nil {
 			log.Printf("%s: %v", m.Topic(), err)
@@ -90,7 +98,7 @@ func (h *handler) handle(_ mqtt.Client, m mqtt.Message) {
 		h.mu.Lock()
 		online := h.presence.apply(id, s)
 		h.mu.Unlock()
-		fmt.Println(formatStatus(id, s, online))
+		fmt.Println(formatStatus(id, s, online, m.Retained()))
 	default:
 		fmt.Printf("%s  %s\n", m.Topic(), m.Payload())
 	}

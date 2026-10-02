@@ -58,6 +58,9 @@ device-003  temp=29.2  humidity=64  battery=73
 | device 數量 | `--count` | | `1` |
 | 發送間隔 | `--interval` | | `2s` |
 | keep alive | `--keepalive` | | `10s` |
+| device ID 前綴 | `--prefix` | | `device` |
+| status / LWT 是否 retained | `--retain` | | `true` |
+| 清除 retained status 後結束 | `--clear-retained` | | `false` |
 | monitor 訂閱（逗號分隔） | `--topic` | | `devices/+/telemetry,devices/+/status` |
 
 ## Phase 1 練習：Pub/Sub 與 wildcard
@@ -125,8 +128,64 @@ kill -CONT $(pgrep -x device)   # 恢復
 
 **練習 7：晚到的 monitor**
 
-先啟動 device，再啟動 monitor。monitor 只看得到 telemetry，看不到任何 status，`online=` 計數也對不上：
-status 訊息只送給當下的訂閱者。Phase 3 會用 retained message 解決這個問題。
+用 `./bin/device --retain=false` 先啟動 device，再啟動 monitor。monitor 只看得到 telemetry，看不到任何 status，`online=` 計數也對不上：
+一般訊息只送給當下的訂閱者。Phase 3 用 retained message 解決這個問題（現在預設就是 retained）。
+
+## Phase 3 練習：Retained Messages
+
+發布時帶 retain flag 的訊息，broker 會替該 topic **保留最新的一則**（每個 topic 最多一則）。
+之後有 client 訂閱到這個 topic，broker 會立刻把保留的那則送給它。
+device 的 status 與 LWT 現在預設都是 retained。
+
+monitor 會在因為訂閱而收到的 retained message 後面標上 `(retained)`；
+即時轉發給既有訂閱者的訊息，即使發布時帶了 retain flag，收到時也不會有這個標記（MQTT 3.1.1 的規則）。
+
+**練習 8：晚到的 monitor（retained 版）**
+
+先啟動 `./bin/device --count 3`，過幾秒再啟動 monitor：
+
+```
+device-001  status=online  reason=connected  online=1  (retained)
+device-002  status=online  reason=connected  online=2  (retained)
+device-003  status=online  reason=connected  online=3  (retained)
+```
+
+和練習 7 比較：monitor 一連上就知道誰在線。
+
+**練習 9：retained offline**
+
+啟動一個 device，`kill -9` 它，然後才啟動 monitor：
+
+```
+device-001  status=offline  reason=lwt  online=0  (retained)
+```
+
+broker 代發的 LWT 也是 retained，所以後來的 monitor 也看得到 device 是怎麼離線的。
+如果 LWT 沒有 retained，broker 保留的會是最後一則 `online`，monitor 會以為 device 還在線。
+
+**練習 10：最新值，不是歷史**
+
+device 依序經歷 online → Ctrl+C（offline graceful），之後啟動 monitor：只會收到一則 `offline reason=graceful (retained)`，
+看不到之前的 online。retained message 是「這個 topic 目前的值」，不是訊息紀錄。
+
+再試：昨天跑過 `--count 10`、今天只跑 `--count 3`，monitor 仍會列出 10 個 device，其中 7 個 offline ——
+retained message 會一直留著，直到被覆蓋或清除。
+
+**練習 11：清除 retained message**
+
+```sh
+./bin/device --count 10 --clear-retained
+```
+
+對 topic 發布**空 payload 的 retained message** 就會刪掉 broker 保留的那則。正在跑的 monitor 會即時看到：
+
+```
+device-001  status=cleared  online=0
+```
+
+之後才啟動的 monitor 則什麼都收不到。
+
+> 本機 mosquitto 沒有開啟 persistence：`task broker:down` 之後 retained message 也會跟著消失。
 
 ## 測試
 
