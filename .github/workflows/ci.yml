@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.work
+          # 每個 module 各有 go.sum
+          cache-dependency-path: "**/go.sum"
+
+      - uses: go-task/setup-task@v2
+        with:
+          version: 3.x
+
+      - name: build
+        run: task build
+
+      - name: vet
+        run: task vet
+
+      - name: unit test
+        run: task test
+
+      - name: taskfile test
+        run: task test:taskfile
+
+      # 用和本機相同的流程：docker compose 起 mosquitto → 對真的 broker 跑整合測試 → 關閉
+      - name: integration test
+        run: task test:integration
