@@ -98,3 +98,15 @@ func ExitsOnInterrupt(t *testing.T, bin string, startup, within time.Duration, a
 	p.Signal(os.Interrupt)
 	p.WaitExit(within)
 }
+
+// ExitCode 回傳已結束 process 的 exit code；須先呼叫 WaitExit。
+func (x *Process) ExitCode() int {
+	x.t.Helper()
+	select {
+	case <-x.done:
+		return x.cmd.ProcessState.ExitCode()
+	default:
+		x.t.Fatalf("%s has not exited", x.name)
+		return -1
+	}
+}
