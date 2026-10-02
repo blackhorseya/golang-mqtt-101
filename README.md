@@ -133,7 +133,10 @@ status 訊息只送給當下的訂閱者。Phase 3 會用 retained message 解�
 ```sh
 task test               # 單元測試，不需要 broker
 task test:integration   # 啟動 mosquitto → 跑整合測試 → 關閉 broker
+task test:taskfile      # 驗證 Taskfile 的 container CLI 偵測
 ```
+
+GitHub Actions（`.github/workflows/ci.yml`）在每個 PR 與 main 上跑同樣的 `build` / `vet` / `test` / `test:taskfile` / `test:integration`。
 
 ## 新增一個 app
 
