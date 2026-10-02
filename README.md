@@ -43,9 +43,9 @@ monitor 會印出：
 device-001  status=online  reason=connected  online=1
 device-002  status=online  reason=connected  online=2
 device-003  status=online  reason=connected  online=3
-device-001  temp=28.4  humidity=61  battery=82
-device-002  temp=27.1  humidity=58  battery=91
-device-003  temp=29.2  humidity=64  battery=73
+device-001  temp=28.4  humidity=61  battery=82  qos=0  lat=0.6ms
+device-002  temp=27.1  humidity=58  battery=91  qos=0  lat=0.5ms
+device-003  temp=29.2  humidity=64  battery=73  qos=0  lat=0.7ms
 ```
 
 `Ctrl+C` 停止；用完 `task broker:down`。
@@ -61,6 +61,9 @@ device-003  temp=29.2  humidity=64  battery=73
 | device ID 前綴 | `--prefix` | | `device` |
 | status / LWT 是否 retained | `--retain` | | `true` |
 | 清除 retained status 後結束 | `--clear-retained` | | `false` |
+| telemetry QoS | `--qos`（device） | | `0` |
+| 訂閱 QoS 上限 | `--qos`（monitor） | | `2` |
+| 統計回報間隔 | `--report`（兩者皆有） | | `5s` |
 | monitor 訂閱（逗號分隔） | `--topic` | | `devices/+/telemetry,devices/+/status` |
 
 ## Phase 1 練習：Pub/Sub 與 wildcard
@@ -186,6 +189,75 @@ device-001  status=cleared  online=0
 之後才啟動的 monitor 則什麼都收不到。
 
 > 本機 mosquitto 沒有開啟 persistence：`task broker:down` 之後 retained message 也會跟著消失。
+
+## Phase 4 練習：QoS
+
+| QoS | 名稱 | publisher → broker 的交握 | 保證 |
+|-----|------|---------------------------|------|
+| 0 | at most once | PUBLISH | 可能遺失，不會重複 |
+| 1 | at least once | PUBLISH → PUBACK | 不會遺失，可能重複（沒收到 PUBACK 就重送） |
+| 2 | exactly once | PUBLISH → PUBREC → PUBREL → PUBCOMP | 這一段不遺失、不重複 |
+
+device 與 monitor 都會定期（`--report`）在 stderr 印統計：
+
+```
+# device
+stats (qos 1): published=490  confirmed=490  unconfirmed=0  avg_ack=2.93ms  sent=69609B  received=2000B
+# monitor
+stats: received=490  qos0=0  qos1=490  qos2=0  dup=0  avg_lat=2.7ms
+```
+
+- `confirmed` / `unconfirmed`：publisher 只知道 broker 有沒有確認。QoS 0 沒有確認，token 一寫進網路層就完成，連「被丟掉」也算 confirmed。
+  QoS 1/2 等不到確認時記為 unconfirmed，但訊息還在 client 裡，重連後可能照樣送出 —— **unconfirmed 不等於遺失**，subscriber 到底收到幾則 publisher 永遠不知道
+- `avg_ack`：從 Publish 到 token 完成的時間，大致是 QoS 0 ≈ 0、QoS 1 ≈ 1 個來回、QoS 2 ≈ 2 個來回
+- `sent` / `received`：連線上實際傳輸的位元組數（含 CONNECT、PINGREQ 等），用來比較協定開銷
+- monitor 每行的 `qos=` 是實際送達的 QoS，`lat=` 是 device 產生資料到 monitor 收到的時間，`dup` 是 broker 重送時帶的 DUP flag
+
+**練習 12：同樣的工作量，不同的 QoS**
+
+```sh
+./bin/device --count 10 --interval 100ms --qos 0 --report 0   # 跑 10 秒後 Ctrl+C
+./bin/device --count 10 --interval 100ms --qos 1 --report 0
+./bin/device --count 10 --interval 100ms --qos 2 --report 0
+```
+
+比較三次結束時的 `avg_ack` 與 `sent` / `received`。本機實測（各跑 5 秒）：
+
+```
+stats (qos 0): published=470  confirmed=470  unconfirmed=0  avg_ack=30µs   sent=65996B  received=40B
+stats (qos 1): published=490  confirmed=490  unconfirmed=0  avg_ack=2.93ms sent=69609B  received=2000B
+stats (qos 2): published=490  confirmed=490  unconfirmed=0  avg_ack=4.16ms sent=71579B  received=3960B
+```
+
+- QoS 0 的 `received` 只有連線時的 CONNACK 等封包；沒有任何確認
+- QoS 1 每則多收一個 PUBACK（4 bytes）：490 × 4 ≈ 1960
+- QoS 2 每則多收 PUBREC + PUBCOMP（8 bytes）、多送一個 PUBREL：`received` 約為 QoS 1 的兩倍，`sent` 也更多
+- `avg_ack` 隨著要等的確認次數增加
+
+**練習 13：訂閱 QoS 是上限**
+
+```sh
+./bin/monitor --qos 0
+./bin/device --qos 2
+```
+
+monitor 印出的是 `qos=0`：實際送達的 QoS = min(發布的 QoS, 訂閱的 QoS)。
+broker 對 publisher 用 QoS 2 交握，對這個 subscriber 只用 QoS 0 —— QoS 是**每一段各自**的約定，不是端到端的。
+
+**重要觀念：QoS 2 不是應用層的 exactly-once**
+
+QoS 只保證「一段連線、一次 session 內」不重複：publisher ↔ broker 一段、broker ↔ subscriber 一段。
+應用層照樣會看到重複，例如：
+
+- publisher 等不到確認，**應用程式自己**重送（換了新的 packet ID，broker 視為新訊息）
+- clean session 斷線重連，in-flight 的狀態被丟棄後重來
+- broker 重啟
+
+所以應用程式仍然需要自己的 idempotency。Phase 5 會在 telemetry 加上序號，讓 monitor 自己判斷重複與遺漏。
+
+> 這個 phase 只看「正常連線」下的 QoS 差異。
+> 斷線時的行為差異（QoS 0 在重連期間直接丟棄、QoS 1/2 先存起來重連後再送）要等 Phase 6 有了斷線工具再觀察。
+> 本機沒有網路問題，`dup` 幾乎不會出現。
 
 ## 測試
 

@@ -1,7 +1,7 @@
 // device 模擬多個 IoT device：每個 device 是一個獨立的 MQTT client，
 // 連上後宣告 online（retained）、定期發送 telemetry，並在連線時設定 LWT。
 //
-//	device --count 10 --interval 1s --keepalive 10s
+//	device --count 10 --interval 1s --keepalive 10s --qos 1
 //	device --count 10 --clear-retained   # 清除這些 device 留在 broker 上的 retained status
 package main
 
@@ -23,9 +23,8 @@ import (
 )
 
 const (
-	// QoS 目前固定為 0（at most once）；Phase 4 才開放設定。
-	telemetryQoS = 0
-	statusQoS    = 0
+	// status 與 LWT 固定 QoS 0；telemetry 的 QoS 由 --qos 設定。
+	statusQoS = 0
 
 	// 對 broker 的單次操作最多等多久；斷線時不能無限等下去。
 	brokerTimeout = 2 * time.Second
@@ -39,8 +38,15 @@ func main() {
 	prefix := flag.String("prefix", "device", "device ID 前綴，ID 為 {prefix}-001、{prefix}-002…")
 	retain := flag.Bool("retain", true, "status 與 LWT 以 retained message 發布（--retain=false 重現 Phase 2 行為）")
 	clearOnly := flag.Bool("clear-retained", false, "不啟動 device，改為清除這些 device 的 retained status 後結束")
+	qosFlag := flag.Int("qos", 0, "telemetry 的 QoS（0、1、2）")
+	report := flag.Duration("report", 5*time.Second, "每隔多久印一次發布統計（0 表示只在結束時印）")
 	flag.StringVar(&cfg.BrokerURL, "broker", cfg.BrokerURL, "broker URL（預設讀 MQTT_BROKER_URL）")
 	flag.Parse()
+
+	qos, err := mqttx.ParseQoS(*qosFlag)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	c, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -52,13 +58,57 @@ func main() {
 		return
 	}
 
+	sim := &simulator{interval: *interval, qos: qos, retain: *retain, stats: &publishStats{}, traffic: &mqttx.Traffic{}}
+	stopReport := sim.reportEvery(*report)
+
 	var wg sync.WaitGroup
 	for n := 1; n <= *count; n++ {
 		devCfg := cfg
 		devCfg.ClientID = mqttx.DeviceID(*prefix, n)
-		wg.Go(func() { runDevice(c, deviceOptions(devCfg, *keepAlive, *retain), devCfg, *interval, *retain) })
+		opts := deviceOptions(devCfg, *keepAlive, *retain).SetCustomOpenConnectionFn(sim.traffic.OpenConnection())
+		wg.Go(func() { sim.runDevice(c, opts, devCfg) })
 	}
 	wg.Wait()
+	stopReport()
+	log.Printf("stats (qos %d): %s", qos, sim.summary())
+}
+
+// simulator 是所有 device 共用的設定與統計。
+type simulator struct {
+	interval time.Duration
+	qos      byte
+	retain   bool
+	stats    *publishStats
+	traffic  *mqttx.Traffic
+}
+
+func (s *simulator) summary() string {
+	return s.stats.summary(s.traffic.Sent(), s.traffic.Received())
+}
+
+// reportEvery 每隔 d 印一次統計；回傳的函式停止回報。d 為 0 時不回報。
+func (s *simulator) reportEvery(d time.Duration) (stop func()) {
+	if d <= 0 {
+		return func() {}
+	}
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		ticker := time.NewTicker(d)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				log.Printf("stats (qos %d): %s", s.qos, s.summary())
+			}
+		}
+	})
+	return func() {
+		close(done)
+		wg.Wait()
+	}
 }
 
 // deviceOptions 建立 device 的連線選項。
@@ -83,7 +133,7 @@ func deviceOptions(cfg mqttx.Config, keepAlive time.Duration, retain bool) *mqtt
 }
 
 // runDevice 連上 broker 後每隔 interval 發一次 telemetry，直到 c 被取消才正常下線。
-func runDevice(c context.Context, opts *mqtt.ClientOptions, cfg mqttx.Config, interval time.Duration, retain bool) {
+func (s *simulator) runDevice(c context.Context, opts *mqtt.ClientOptions, cfg mqttx.Config) {
 	id := cfg.ClientID
 	client := mqtt.NewClient(opts)
 	if err := mqttx.Connect(c, client); err != nil {
@@ -92,29 +142,32 @@ func runDevice(c context.Context, opts *mqtt.ClientOptions, cfg mqttx.Config, in
 	}
 	log.Printf("%s: connected to %s", id, cfg.BrokerURL)
 
-	s := newSensor(id, rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())))
+	sensor := newSensor(id, rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())))
 	topic := mqttx.TelemetryTopic(id)
 	published := 0
 
-	ticker := time.NewTicker(interval)
+	ticker := time.NewTicker(s.interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-c.Done():
 			// 正常下線：先自己宣告 offline，再送 DISCONNECT（broker 因此不會發布 LWT）。
 			// 此時 c 已取消，所以用新的 context；broker 不在時最多等 brokerTimeout。
-			publishStatus(context.Background(), client, id, mqttx.StateOffline, mqttx.ReasonGraceful, retain)
+			publishStatus(context.Background(), client, id, mqttx.StateOffline, mqttx.ReasonGraceful, s.retain)
 			client.Disconnect(250)
 			log.Printf("%s: disconnected, published %d telemetry", id, published)
 			return
 		case now := <-ticker.C:
-			payload, err := mqttx.EncodeTelemetry(s.next(now))
+			payload, err := mqttx.EncodeTelemetry(sensor.next(now))
 			if err != nil {
 				log.Printf("%s: %v", id, err)
 				continue
 			}
-			// QoS 0 的 token 在送進網路層後就完成，不代表 broker 或任何 subscriber 收到了
-			if err := mqttx.Wait(c, client.Publish(topic, telemetryQoS, false, payload), brokerTimeout); err != nil {
+			// token 完成的時機取決於 QoS：0 是寫進網路層、1 是收到 PUBACK、2 是收到 PUBCOMP
+			start := time.Now()
+			err = mqttx.Wait(c, client.Publish(topic, s.qos, false, payload), brokerTimeout)
+			s.stats.record(time.Since(start), err)
+			if err != nil {
 				log.Printf("%s: publish %s: %v", id, topic, err)
 				continue
 			}

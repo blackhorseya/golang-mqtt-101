@@ -2,6 +2,7 @@
 //
 //	monitor                       # 預設訂閱 devices/+/telemetry 與 devices/+/status
 //	monitor --topic 'devices/#'   # 試試多層 wildcard
+//	monitor --qos 0               # 以 QoS 0 訂閱：訊息最高只會以 QoS 0 送達
 package main
 
 import (
@@ -25,18 +26,24 @@ func main() {
 	// 預設 ClientID 帶 pid，讓多個 monitor 可以同時跑而不互踢
 	cfg := mqttx.ConfigFromEnv(fmt.Sprintf("monitor-%d", os.Getpid()))
 	topics := flag.String("topic", "devices/+/telemetry,devices/+/status", "訂閱的 topic filter，多個以逗號分隔（可用 + 與 #）")
+	qosFlag := flag.Int("qos", 2, "訂閱的 QoS 上限（0、1、2）；訊息實際送達的 QoS = min(發布的 QoS, 此值)")
+	report := flag.Duration("report", 5*time.Second, "每隔多久印一次接收統計（0 表示只在結束時印）")
 	flag.StringVar(&cfg.BrokerURL, "broker", cfg.BrokerURL, "broker URL（預設讀 MQTT_BROKER_URL）")
 	flag.Parse()
 
+	qos, err := mqttx.ParseQoS(*qosFlag)
+	if err != nil {
+		log.Fatal(err)
+	}
 	filters := map[string]byte{}
 	for _, f := range parseFilters(*topics) {
-		filters[f] = 0
+		filters[f] = qos
 	}
 
 	c, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	h := &handler{presence: presence{}}
+	h := &handler{presence: presence{}, stats: &receiveStats{}}
 	opts := cfg.ClientOptions().
 		SetConnectRetry(true).
 		SetConnectRetryInterval(time.Second).
@@ -56,14 +63,30 @@ func main() {
 	}
 	log.Printf("connected to %s as %s", cfg.BrokerURL, cfg.ClientID)
 
-	<-c.Done()
+	if *report > 0 {
+		ticker := time.NewTicker(*report)
+		defer ticker.Stop()
+	loop:
+		for {
+			select {
+			case <-c.Done():
+				break loop
+			case <-ticker.C:
+				log.Printf("stats: %s", h.stats.summary())
+			}
+		}
+	} else {
+		<-c.Done()
+	}
 	client.Disconnect(250)
+	log.Printf("stats: %s", h.stats.summary())
 }
 
 // handler 處理收到的訊息並維護 device 在線狀態。
 type handler struct {
 	mu       sync.Mutex
 	presence presence
+	stats    *receiveStats
 }
 
 // handle 依 topic 印出訊息：telemetry 與 status 以固定格式呈現，其他 topic（例如用 devices/# 訂閱時）印原始內容。
@@ -75,7 +98,10 @@ func (h *handler) handle(_ mqtt.Client, m mqtt.Message) {
 			log.Printf("%s: %v", m.Topic(), err)
 			return
 		}
-		fmt.Println(formatTelemetry(t))
+		// 端到端延遲：device 產生 telemetry 到 monitor 收到（同一台機器，時鐘一致）
+		latency := time.Since(t.Timestamp)
+		h.stats.record(m.Qos(), m.Duplicate(), latency)
+		fmt.Println(formatTelemetry(t, m.Qos(), m.Duplicate(), latency))
 	case strings.HasSuffix(m.Topic(), "/status"):
 		id, err := mqttx.DeviceIDFromTopic(m.Topic())
 		if err != nil {
