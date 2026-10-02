@@ -121,10 +121,17 @@ func (x *Process) ExitCode() int {
 // WaitOutput 等到輸出中出現 substr，timeout 就失敗。
 func (x *Process) WaitOutput(substr string, timeout time.Duration) {
 	x.t.Helper()
+	x.WaitCount(substr, 1, timeout)
+}
+
+// WaitCount 等到輸出中 substr 出現至少 n 次，timeout 就失敗。
+func (x *Process) WaitCount(substr string, n int, timeout time.Duration) {
+	x.t.Helper()
 	deadline := time.Now().Add(timeout)
-	for !strings.Contains(x.out.String(), substr) {
+	for strings.Count(x.out.String(), substr) < n {
 		if time.Now().After(deadline) {
-			x.t.Fatalf("%s: %q not in output after %s\noutput:\n%s", x.name, substr, timeout, x.out.String())
+			x.t.Fatalf("%s: %q appeared %d times (want %d) after %s\noutput:\n%s",
+				x.name, substr, strings.Count(x.out.String(), substr), n, timeout, x.out.String())
 		}
 		time.Sleep(50 * time.Millisecond)
 	}

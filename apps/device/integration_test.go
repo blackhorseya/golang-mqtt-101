@@ -302,19 +302,24 @@ func TestIntegrationDuplicateSurvivesQoS2(t *testing.T) {
 	m := f.startMonitor()
 
 	p := f.start("--qos", "2", "--dup-rate", "1")
-	m.WaitOutput("seq=1  qos=2", 10*time.Second)
-	m.WaitOutput("seq=2  qos=2", 10*time.Second)
+	// 重送是在原本那則確認之後才發，所以要等第二份到了才能中斷 device
+	m.WaitCount("seq=1  qos=2", 2, 10*time.Second)
+	m.WaitCount("seq=2  qos=2", 2, 10*time.Second)
 	p.Signal(os.Interrupt)
 	p.WaitExit(5 * time.Second)
 
+	// 每個 seq 的兩份裡，第一份被接受、第二份被判為重複
 	out := m.Output()
-	for _, line := range []string{"seq=1  qos=2", "seq=2  qos=2"} {
-		if n := strings.Count(out, line); n < 2 {
-			t.Errorf("%q appeared %d times, want each seq delivered twice\n%s", line, n, out)
+	for _, seq := range []string{"seq=1  qos=2", "seq=2  qos=2"} {
+		var verdicts []string
+		for line := range strings.SplitSeq(out, "\n") {
+			if strings.Contains(line, seq) {
+				verdicts = append(verdicts, line[strings.LastIndex(line, "  ")+2:])
+			}
 		}
-	}
-	if !strings.Contains(out, "duplicate") {
-		t.Errorf("monitor did not flag any duplicate\n%s", out)
+		if len(verdicts) < 2 || verdicts[0] != "accepted" || verdicts[1] != "duplicate" {
+			t.Errorf("%s verdicts = %q, want [accepted duplicate ...]\n%s", seq, verdicts, out)
+		}
 	}
 }
 
@@ -329,13 +334,8 @@ func TestIntegrationRestartedDeviceStartsNewSequence(t *testing.T) {
 	first.WaitExit(3 * time.Second)
 
 	second := f.start()
-	deadline := time.Now().Add(10 * time.Second)
-	for strings.Count(m.Output(), "seq=2  ") < 2 {
-		if time.Now().After(deadline) {
-			t.Fatalf("restarted device did not reach seq=2\n%s", m.Output())
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	// 第一次執行與重啟後各出現一次 seq=2
+	m.WaitCount("seq=2  ", 2, 10*time.Second)
 	second.Signal(os.Interrupt)
 	second.WaitExit(5 * time.Second)
 
