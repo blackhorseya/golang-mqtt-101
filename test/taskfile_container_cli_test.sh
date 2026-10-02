@@ -12,6 +12,14 @@ trap 'command rm -rf "$WORK"' EXIT
 
 fail=0
 
+# Taskfile 的 vars 只需要這些外部指令；只把它們放進 PATH，
+# 不放整個 /usr/bin，否則系統裝了 docker（例如 GitHub Actions 的 ubuntu runner）就測不到「只有 podman」的情況
+TOOLS="$WORK/tools"
+mkdir -p "$TOOLS"
+for tool in sh find sed tr ls dirname; do
+  ln -s "$(command -v "$tool")" "$TOOLS/$tool"
+done
+
 # make_stub <dir> <name>：建立一個把自己名字與參數寫進 $WORK/calls 的假 CLI
 make_stub() {
   mkdir -p "$1"
@@ -28,7 +36,7 @@ run_case() {
   shift 3
   : >"$WORK/calls"
   local out
-  out="$(cd "$ROOT" && env -i HOME="$HOME" PATH="$stubs:/usr/bin:/bin" "$@" "$TASK_BIN" broker:up 2>&1)"
+  out="$(cd "$ROOT" && env -i HOME="$HOME" PATH="$stubs:$TOOLS" "$@" "$TASK_BIN" broker:up 2>&1)"
   local rc=$?
   local got
   got="$(cat "$WORK/calls")"
