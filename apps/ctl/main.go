@@ -94,7 +94,7 @@ func request(c context.Context, cfg mqttx.Config, device, name string, cmd mqttx
 		default:
 		}
 	})
-	if err := mqttx.Wait(c, tok, brokerTimeout); err != nil {
+	if err := mqttx.WaitSubscribe(c, tok, brokerTimeout); err != nil {
 		return mqttx.Ack{}, 0, fmt.Errorf("subscribe %s: %w", mqttx.AckTopic(device), err)
 	}
 

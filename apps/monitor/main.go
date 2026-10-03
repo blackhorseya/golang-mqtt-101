@@ -59,9 +59,10 @@ func main() {
 		// 在 OnConnect 裡訂閱：clean session 下斷線重連後 broker 不會記得舊訂閱，每次連上都要重訂。
 		// persistent session 下 broker 記得訂閱，重訂一次也無妨（同一個 filter 只是覆蓋）
 		SetOnConnectHandler(func(client mqtt.Client) {
+			// broker 拒絕訂閱時 token 沒有錯誤，要看 SUBACK 結果（WaitSubscribe 會檢查）
 			tok := client.SubscribeMultiple(filters, h.handle)
-			if tok.Wait() && tok.Error() != nil {
-				log.Printf("subscribe %s: %v", *topics, tok.Error())
+			if err := mqttx.WaitSubscribe(context.Background(), tok, 10*time.Second); err != nil {
+				log.Printf("subscribe %s: %v", *topics, err)
 				return
 			}
 			log.Printf("subscribed to %s", *topics)

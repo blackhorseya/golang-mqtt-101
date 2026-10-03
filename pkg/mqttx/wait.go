@@ -27,3 +27,29 @@ func Wait(c context.Context, tok mqtt.Token, timeout time.Duration) error {
 		return fmt.Errorf("wait for broker: %w", c.Err())
 	}
 }
+
+// ErrSubscribeRefused 表示 broker 在 SUBACK 回傳失敗（0x80）拒絕了訂閱。
+var ErrSubscribeRefused = errors.New("subscription refused by broker")
+
+// subackFailure 是 MQTT 3.1.1 SUBACK 的失敗代碼；成功時回傳的是 broker 給的 QoS（0、1、2）。
+const subackFailure = 0x80
+
+// WaitSubscribe 等 Subscribe 的 token 完成，並檢查 SUBACK 結果。
+//
+// broker 拒絕訂閱（例如 ACL 不允許）時，paho 照樣把 token 標為完成、Error() 是 nil，
+// 失敗只記在 SubscribeToken.Result() 裡；只看 Error() 會以為訂閱成功。
+func WaitSubscribe(c context.Context, tok mqtt.Token, timeout time.Duration) error {
+	if err := Wait(c, tok, timeout); err != nil {
+		return err
+	}
+	sub, ok := tok.(interface{ Result() map[string]byte })
+	if !ok {
+		return nil
+	}
+	for filter, code := range sub.Result() {
+		if code == subackFailure {
+			return fmt.Errorf("subscribe %s: %w", filter, ErrSubscribeRefused)
+		}
+	}
+	return nil
+}

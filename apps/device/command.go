@@ -58,7 +58,7 @@ func withCommands(opts *mqtt.ClientOptions, id string, commands chan<- received)
 	return opts.SetOnConnectHandler(func(client mqtt.Client) {
 		for {
 			tok := client.Subscribe(mqttx.CommandFilter(id), commandQoS, handle)
-			err := mqttx.Wait(context.Background(), tok, brokerTimeout)
+			err := mqttx.WaitSubscribe(context.Background(), tok, brokerTimeout)
 			if err == nil {
 				break
 			}
