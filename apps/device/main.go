@@ -4,6 +4,7 @@
 //	device --count 10 --interval 1s --keepalive 10s --qos 1
 //	device --qos 2 --dup-rate 0.2        # 20% 的 telemetry 由應用程式再發一次
 //	device --count 10 --clear-retained   # 清除這些 device 留在 broker 上的 retained status
+//	device --qos 1 --outage-every 15s --outage-for 5s   # 每 15 秒斷線 5 秒，觀察重連與補送
 package main
 
 import (
@@ -43,6 +44,10 @@ func main() {
 	report := flag.Duration("report", 5*time.Second, "每隔多久印一次發布統計（0 表示只在結束時印）")
 	dupFlag := flag.Float64("dup-rate", 0, "每筆 telemetry 由應用程式再發一次的機率（0–1），模擬應用層重送")
 	skipFlag := flag.Float64("skip-rate", 0, "每筆 telemetry 用掉序號但不發出的機率（0–1），模擬送出前遺失")
+	outageEvery := flag.Duration("outage-every", 0, "每隔多久模擬一次網路中斷（0 表示不中斷）；所有 device 同時斷線")
+	outageFor := flag.Duration("outage-for", 5*time.Second, "每次中斷持續多久；期間重連都會失敗")
+	cleanSession := flag.Bool("clean-session", true, "以 clean session 連線；false 時 broker 依 ClientID 保留 session")
+	maxReconnect := flag.Duration("max-reconnect-interval", 10*time.Minute, "斷線後自動重連的 backoff 上限（paho 從 1 秒開始加倍）")
 	flag.StringVar(&cfg.BrokerURL, "broker", cfg.BrokerURL, "broker URL（預設讀 MQTT_BROKER_URL）")
 	flag.Parse()
 
@@ -58,6 +63,10 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	if err := mqttx.ParseOutage(*outageEvery, *outageFor); err != nil {
+		log.Fatal(err)
+	}
+	session := mqttx.Session{Clean: *cleanSession, MaxReconnectInterval: *maxReconnect}
 
 	c, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -82,11 +91,22 @@ func main() {
 	}
 	stopReport := sim.reportEvery(*report)
 
+	// 所有 device 的連線都經過同一個 outage，所以一次中斷會讓整個 fleet 同時斷線
+	outage := &mqttx.Outage{}
+	dial := outage.OpenConnection(sim.traffic.OpenConnection())
+
 	var wg sync.WaitGroup
+	if *outageEvery > 0 {
+		wg.Go(func() {
+			outage.Every(c, *outageEvery, *outageFor, func(closed int) {
+				log.Printf("outage: cut %d connection(s) for %s", closed, *outageFor)
+			})
+		})
+	}
 	for n := 1; n <= *count; n++ {
 		devCfg := cfg
 		devCfg.ClientID = mqttx.DeviceID(*prefix, n)
-		opts := deviceOptions(devCfg, *keepAlive, *retain).SetCustomOpenConnectionFn(sim.traffic.OpenConnection())
+		opts := session.Apply(deviceOptions(devCfg, *keepAlive, *retain), devCfg.ClientID).SetCustomOpenConnectionFn(dial)
 		wg.Go(func() { sim.runDevice(c, opts, devCfg) })
 	}
 	wg.Wait()

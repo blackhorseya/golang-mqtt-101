@@ -40,8 +40,12 @@ func TestOutageCutClosesConnectionsAndRefusesDial(t *testing.T) {
 	if _, err := peer.Read(make([]byte, 1)); err == nil {
 		t.Error("peer read succeeded after Cut, want error")
 	}
-	if _, err := conn.Write([]byte("x")); err == nil {
-		t.Error("write on cut connection succeeded, want error")
+	// 必須是 ErrOutage，而不是 "use of closed network connection"：paho 會忽略後者，不觸發重連
+	if _, err := conn.Write([]byte("x")); !errors.Is(err, ErrOutage) {
+		t.Errorf("write on cut connection error = %v, want ErrOutage", err)
+	}
+	if _, err := conn.Read(make([]byte, 1)); !errors.Is(err, ErrOutage) {
+		t.Errorf("read on cut connection error = %v, want ErrOutage", err)
 	}
 
 	if _, err := dial(uri, mqtt.ClientOptions{}); !errors.Is(err, ErrOutage) {
