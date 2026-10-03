@@ -27,20 +27,29 @@ func (x *Traffic) Wrap(conn net.Conn) net.Conn {
 	return &countingConn{Conn: conn, traffic: x}
 }
 
-// OpenConnection 給 ClientOptions.SetCustomOpenConnectionFn 使用：自己撥 TCP 連線並包上計數。
-// 每次（重新）連線都會呼叫，所以數字會跨重連累計。只支援 tcp://。
+// OpenConnection 給 ClientOptions.SetCustomOpenConnectionFn 使用：用 DialTCP 撥號並包上計數。
+// 每次（重新）連線都會呼叫，所以數字會跨重連累計。
 func (x *Traffic) OpenConnection() mqtt.OpenConnectionFunc {
 	return func(uri *url.URL, options mqtt.ClientOptions) (net.Conn, error) {
-		if uri.Scheme != "tcp" && uri.Scheme != "mqtt" {
-			return nil, fmt.Errorf("open connection %s: only tcp:// is supported", uri)
-		}
-		d := net.Dialer{Timeout: options.ConnectTimeout}
-		conn, err := d.Dial("tcp", uri.Host)
+		conn, err := DialTCP(uri, options)
 		if err != nil {
-			return nil, fmt.Errorf("dial %s: %w", uri.Host, err)
+			return nil, err
 		}
 		return x.Wrap(conn), nil
 	}
+}
+
+// DialTCP 是最基本的 mqtt.OpenConnectionFunc：直接撥 TCP，供需要自己包裝連線的地方當底層。只支援 tcp://。
+func DialTCP(uri *url.URL, options mqtt.ClientOptions) (net.Conn, error) {
+	if uri.Scheme != "tcp" && uri.Scheme != "mqtt" {
+		return nil, fmt.Errorf("open connection %s: only tcp:// is supported", uri)
+	}
+	d := net.Dialer{Timeout: options.ConnectTimeout}
+	conn, err := d.Dial("tcp", uri.Host)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", uri.Host, err)
+	}
+	return conn, nil
 }
 
 type countingConn struct {

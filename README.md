@@ -8,7 +8,7 @@
 apps/device/     device simulator：每個 device 是獨立的 MQTT client
 apps/monitor/    用 wildcard 訂閱 device 訊息並印到 terminal
 apps/hello/      go.work 範例 app
-pkg/mqttx/       共用 module：設定、topic、telemetry payload
+pkg/mqttx/       共用 module：設定、topic、telemetry payload、模擬斷線
 deployments/     部署設定（docker/ 內含本機 mosquitto，只綁 127.0.0.1）
 go.work          把以上 module 串成一個 workspace
 ```
@@ -67,6 +67,11 @@ device-003  temp=29.2  humidity=64  battery=73  seq=1  qos=0  lat=0.7ms  accepte
 | 應用層重送機率 | `--dup-rate`（device） | | `0` |
 | 跳號（送出前遺失）機率 | `--skip-rate`（device） | | `0` |
 | monitor 訂閱（逗號分隔） | `--topic` | | `devices/+/telemetry,devices/+/status` |
+| 每隔多久模擬一次斷線（0 表示不斷） | `--outage-every`（兩者皆有） | | `0` |
+| 每次斷線多久 | `--outage-for`（兩者皆有） | | `5s` |
+| clean session | `--clean-session`（兩者皆有） | | `true` |
+| 自動重連 backoff 上限 | `--max-reconnect-interval`（兩者皆有） | | `10m` |
+| monitor 的 ClientID | | `MQTT_CLIENT_ID` | `monitor-{pid}` |
 
 ## Phase 1 練習：Pub/Sub 與 wildcard
 
@@ -258,7 +263,7 @@ QoS 只保證「一段連線、一次 session 內」不重複：publisher ↔ br
 所以應用程式仍然需要自己的 idempotency。Phase 5 會在 telemetry 加上序號，讓 monitor 自己判斷重複與遺漏。
 
 > 這個 phase 只看「正常連線」下的 QoS 差異。
-> 斷線時的行為差異（QoS 0 在重連期間直接丟棄、QoS 1/2 先存起來重連後再送）要等 Phase 6 有了斷線工具再觀察。
+> 斷線時的行為差異（QoS 0 在重連期間直接丟棄、QoS 1/2 先存起來重連後再送）見 Phase 6。
 > 本機沒有網路問題，`dup` 幾乎不會出現。
 
 ## Phase 5 練習：序號與 Idempotency
@@ -306,7 +311,7 @@ QoS 2 的交握照樣完成、broker 照樣轉發。結束時比較 device 的 `
 比較 device 的 `skipped` 與 monitor 的 `missing`，`missing` 通常會**少一點**（本機實測 23 vs 21）：
 只有被前後兩筆夾住的遺失才看得出來。device 的第一筆就被跳過時，monitor 從第二筆開始算；
 最後幾筆被跳過時，後面沒有訊息可以讓 monitor 發現 —— 序號只能偵測「之後有人來」的遺失。
-Phase 6 斷線時用 QoS 0 會看到真正的遺失。
+Phase 6 斷線時用 QoS 0 會看到真正的遺失（練習 18）。
 
 **練習 16：device 重啟**
 
@@ -323,6 +328,134 @@ monitor 不知道之前發生什麼，只能從它看到的第一筆開始算。
 - MQTT 對同一個 publisher、同一個 topic 保證順序，所以本機幾乎看不到 `out-of-order`
 - 一則很晚才到的舊訊息，和一則重複的舊訊息，都會落在 `out-of-order`，分不出來
 - 要分得出來就得記住處理過的序號集合（例如滑動視窗），那已經是「複雜的去重系統」了 —— 這個 repo 刻意不做
+
+## Phase 6 練習：網路中斷
+
+`--outage-every 6s --outage-for 3s` 讓程式每 6 秒把自己的 TCP 連線直接關掉，接下來 3 秒內重新連線都會失敗。
+它不送 DISCONNECT，所以對 broker 來說就和網路線被拔掉一樣；device 和 monitor 都有這兩個 flag。
+（device 的所有連線一起斷，模擬整個 fleet 所在的網路中斷。）
+
+```
+2026/10/03 11:07:50 outage: cut 1 connection(s) for 3s
+2026/10/03 11:07:50 device-001: connection lost: read: simulated network outage
+2026/10/03 11:07:50 device-001: reconnecting
+2026/10/03 11:07:51 device-001: reconnecting
+2026/10/03 11:07:53 device-001: reconnecting
+2026/10/03 11:07:53 device-001: status online (connected)
+```
+
+斷線那一刻 broker 就看到 TCP 關閉，monitor 會立刻收到 `status=offline  reason=lwt`；重連後 device 再宣告 `online`。
+LWT 剛好把每次中斷框起來。
+
+斷線期間 paho 的 client 處於 reconnecting 狀態，這時呼叫 `Publish`：
+
+| QoS | paho 怎麼處理 | token | 重連後 |
+|-----|---------------|-------|--------|
+| 0 | 直接丟掉 | **立刻回報完成，沒有錯誤** | 沒了 |
+| 1、2 | 存在 client 端（預設是記憶體） | 等到重連、broker 確認後才完成 | 依序補送 |
+
+**練習 18：QoS 0 斷線就遺失，而且 publisher 不知道**
+
+```sh
+./bin/monitor
+./bin/device --interval 500ms --qos 0 --outage-every 6s --outage-for 3s
+```
+
+```
+device-001  ...  seq=19  qos=0  lat=5.5ms  gap(missing=7)
+```
+
+本機實測斷 3 秒、每 0.5 秒一筆：monitor 看到 `gap(missing=7)`，而 device 的統計是 `confirmed=29  unconfirmed=0` —— **每一筆都「成功」了**。
+QoS 0 的完成只代表「交出去了」，斷線時連交出去都沒有，paho 照樣回報完成。
+不靠序號，從 publisher 端完全看不出這 7 筆不見了。
+
+**練習 19：QoS 1/2 補送，但 publisher 看到的是 unconfirmed**
+
+```sh
+./bin/monitor
+./bin/device --interval 500ms --qos 1 --outage-every 6s --outage-for 3s
+```
+
+monitor 沒有任何 gap，但斷線期間那幾筆的 `lat` 是秒級：它們在 device 裡排隊，重連後一口氣送出。
+device 那邊則每筆都等不到確認（每筆最多等 2 秒），統計記成 `unconfirmed` ——
+**unconfirmed 不等於遺失**，它們在重連後送達了。QoS 2 的結果相同。
+
+補送的前提是 process 還活著：排隊的訊息存在記憶體，斷線期間按 Ctrl+C 就跟著消失。
+（這時 device 印出的 `status offline (graceful)` 也是 QoS 0，同樣在 reconnecting 狀態下被默默丟掉了。）
+
+**練習 20：重連策略與 backoff**
+
+```sh
+./bin/device --qos 1 --outage-every 25s --outage-for 10s
+./bin/device --qos 1 --outage-every 25s --outage-for 10s --max-reconnect-interval 1s
+```
+
+看兩者 `reconnecting` 的時間點（本機實測，斷線 10 秒）：
+
+| `--max-reconnect-interval` | 重連嘗試（距斷線） | 恢復連線 |
+|----------------------------|--------------------|----------|
+| `10m`（paho 預設） | 0、1、3、7、15 秒 | 15 秒後 |
+| `1s` | 每秒一次 | 10 秒後 |
+
+paho 每次重連失敗就把等待時間加倍，上限是 MaxReconnectInterval。
+backoff 讓上千台 device 不會在 broker 剛恢復時同時湧入，代價是網路已經好了，device 卻還在等下一次嘗試 ——
+上表預設值那一列多斷了 5 秒，這段時間的資料全部在 device 裡排隊。
+另外 `SetConnectRetryInterval` 只管**第一次**連線失敗的重試間隔，和斷線後的 backoff 是兩回事。
+
+**練習 21：subscriber 斷線 —— clean session vs persistent session**
+
+這次讓 monitor 斷線，device 正常發送 QoS 1：
+
+```sh
+./bin/device --interval 500ms --qos 1
+./bin/monitor --qos 1 --outage-every 6s --outage-for 3s                          # clean session
+./bin/monitor --qos 1 --outage-every 6s --outage-for 3s --clean-session=false    # persistent session
+```
+
+| monitor | 結果（本機實測斷 3 秒） |
+|---------|------|
+| clean session | `gap(missing=6)`：broker 不記得這個 client，斷線期間的訊息沒有人收 |
+| persistent session | 沒有 gap、`avg_lat=548ms`：broker 依 ClientID 保留訂閱，替它把訊息排隊，重連後補送 |
+
+注意 device 那邊斷線的是 **publisher 的 client 端佇列**（練習 19）；這裡排隊的是 **broker** —— 兩個不同的地方。
+
+persistent session 要排得到隊，三個條件缺一不可：
+
+- 同一個 ClientID：broker 用 ClientID 找回 session
+- 實際送達的 QoS ≥ 1：發布與訂閱的 QoS 都要 ≥ 1。mosquitto 預設不替離線 client 排 QoS 0 訊息
+- broker 沒有重啟：這個 repo 的 mosquitto 沒開 persistence，session 只存在記憶體
+
+**練習 22：persistent session 跨越 process 重啟**
+
+monitor 預設的 ClientID 帶 pid，每次啟動都不同；用環境變數固定它：
+
+```sh
+./bin/device --interval 500ms --qos 1
+MQTT_CLIENT_ID=my-monitor ./bin/monitor --qos 1 --clean-session=false
+# Ctrl+C，等幾秒再啟動同一行
+```
+
+```
+connected to tcp://localhost:1883 as my-monitor (clean session false)
+device-001  ...  seq=6   qos=1  lat=4.0361s  accepted
+device-001  ...  seq=7   qos=1  lat=3.5361s  accepted
+...
+device-001  ...  seq=14  qos=1  lat=36.7ms   accepted
+subscribed to devices/+/telemetry,devices/+/status
+```
+
+離線期間的訊息在**訂閱完成之前**就到了：broker 回 CONNACK 時就知道 session 還在，馬上補送排隊的訊息，
+不用等 monitor 重新 SUBSCRIBE。`lat` 從 4 秒遞減，正好是每筆在 broker 排隊的時間。
+
+用完之後，以同一個 ClientID 用 clean session 連一次（`MQTT_CLIENT_ID=my-monitor ./bin/monitor`），broker 就會刪掉這個 session；
+不然它會一直替一個不會回來的 client 排隊（mosquitto 預設最多排 1000 則）。
+
+**device 端的 `--clean-session`**
+
+paho 在**自動重連**時不論 clean session 與否，都會補送 client 端排隊的訊息，所以 device 端看不太出差別。
+差別在 broker：clean session 下 broker 每次連線都丟掉這個 client 的 in-flight 狀態。
+理論上，QoS 2 的訊息剛送出、還沒收到 PUBREC 就斷線，重連後 paho 重送，broker 已經忘了它 —— 可能轉發兩次。
+時機很難湊到，本機沒有觀察到；有興趣可以用很短的 `--outage-every` 搭配 `--qos 2` 長時間跑，看 monitor 有沒有 `duplicate`。
 
 ## 測試
 

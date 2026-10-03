@@ -3,6 +3,7 @@
 //	monitor                       # 預設訂閱 devices/+/telemetry 與 devices/+/status
 //	monitor --topic 'devices/#'   # 試試多層 wildcard
 //	monitor --qos 0               # 以 QoS 0 訂閱：訊息最高只會以 QoS 0 送達
+//	monitor --clean-session=false --outage-every 15s --outage-for 5s   # 斷線期間由 broker 替 monitor 排隊訊息
 package main
 
 import (
@@ -28,6 +29,10 @@ func main() {
 	topics := flag.String("topic", "devices/+/telemetry,devices/+/status", "訂閱的 topic filter，多個以逗號分隔（可用 + 與 #）")
 	qosFlag := flag.Int("qos", 2, "訂閱的 QoS 上限（0、1、2）；訊息實際送達的 QoS = min(發布的 QoS, 此值)")
 	report := flag.Duration("report", 5*time.Second, "每隔多久印一次接收統計（0 表示只在結束時印）")
+	outageEvery := flag.Duration("outage-every", 0, "每隔多久模擬一次網路中斷（0 表示不中斷）")
+	outageFor := flag.Duration("outage-for", 5*time.Second, "每次中斷持續多久；期間重連都會失敗")
+	cleanSession := flag.Bool("clean-session", true, "以 clean session 連線；false 時 broker 依 ClientID 保留訂閱，並在離線期間替它排隊 QoS 1/2 訊息")
+	maxReconnect := flag.Duration("max-reconnect-interval", 10*time.Minute, "斷線後自動重連的 backoff 上限（paho 從 1 秒開始加倍）")
 	flag.StringVar(&cfg.BrokerURL, "broker", cfg.BrokerURL, "broker URL（預設讀 MQTT_BROKER_URL）")
 	flag.Parse()
 
@@ -35,6 +40,10 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	if err := mqttx.ParseOutage(*outageEvery, *outageFor); err != nil {
+		log.Fatal(err)
+	}
+	session := mqttx.Session{Clean: *cleanSession, MaxReconnectInterval: *maxReconnect}
 	filters := map[string]byte{}
 	for _, f := range parseFilters(*topics) {
 		filters[f] = qos
@@ -44,10 +53,11 @@ func main() {
 	defer stop()
 
 	h := &handler{presence: presence{}, seq: newSeqTracker(), stats: &receiveStats{}}
-	opts := cfg.ClientOptions().
+	opts := session.Apply(cfg.ClientOptions(), cfg.ClientID).
 		SetConnectRetry(true).
 		SetConnectRetryInterval(time.Second).
-		// 在 OnConnect 裡訂閱：clean session 下斷線重連後 broker 不會記得舊訂閱，每次連上都要重訂
+		// 在 OnConnect 裡訂閱：clean session 下斷線重連後 broker 不會記得舊訂閱，每次連上都要重訂。
+		// persistent session 下 broker 記得訂閱，重訂一次也無妨（同一個 filter 只是覆蓋）
 		SetOnConnectHandler(func(client mqtt.Client) {
 			tok := client.SubscribeMultiple(filters, h.handle)
 			if tok.Wait() && tok.Error() != nil {
@@ -56,12 +66,19 @@ func main() {
 			}
 			log.Printf("subscribed to %s", *topics)
 		})
+	if *outageEvery > 0 {
+		outage := &mqttx.Outage{}
+		opts.SetCustomOpenConnectionFn(outage.OpenConnection(mqttx.DialTCP))
+		go outage.Every(c, *outageEvery, *outageFor, func(closed int) { // fire-and-forget: 隨 c 取消結束，process 隨後退出
+			log.Printf("outage: cut %d connection(s) for %s", closed, *outageFor)
+		})
+	}
 	client := mqtt.NewClient(opts)
 	if err := mqttx.Connect(c, client); err != nil {
 		log.Printf("%s: %v", cfg.BrokerURL, err)
 		return
 	}
-	log.Printf("connected to %s as %s", cfg.BrokerURL, cfg.ClientID)
+	log.Printf("connected to %s as %s (clean session %t)", cfg.BrokerURL, cfg.ClientID, *cleanSession)
 
 	if *report > 0 {
 		ticker := time.NewTicker(*report)
