@@ -38,6 +38,11 @@ func (x *Outage) OpenConnection(next mqtt.OpenConnectionFunc) mqtt.OpenConnectio
 		tracked := &trackedConn{Conn: conn, outage: x}
 		x.mu.Lock()
 		defer x.mu.Unlock()
+		// 撥號期間可能已經 Cut 過：那次 Cut 看不到這條連線，所以在同一把鎖下再檢查一次
+		if time.Now().Before(x.until) {
+			conn.Close()
+			return nil, fmt.Errorf("dial %s: %w", uri.Host, ErrOutage)
+		}
 		if x.conns == nil {
 			x.conns = map[*trackedConn]struct{}{}
 		}
