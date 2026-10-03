@@ -77,6 +77,42 @@ func TestOutageForgetsClosedConnections(t *testing.T) {
 	}
 }
 
+// 撥號進行中發生 Cut：Cut 當下還沒有這條連線可關，撥號完成時必須發現已在中斷期間，關掉它並回報 ErrOutage。
+func TestOutageCutDuringDial(t *testing.T) {
+	var outage Outage
+	dialing := make(chan struct{})
+	release := make(chan struct{})
+	peers := make(chan net.Conn, 1)
+	next := pipeDialer(peers)
+	dial := outage.OpenConnection(func(uri *url.URL, options mqtt.ClientOptions) (net.Conn, error) {
+		close(dialing)
+		<-release
+		return next(uri, options)
+	})
+
+	errs := make(chan error, 1)
+	go func() {
+		conn, err := dial(&url.URL{Scheme: "tcp"}, mqtt.ClientOptions{})
+		if err == nil {
+			conn.Close()
+		}
+		errs <- err
+	}()
+	<-dialing
+	outage.Cut(time.Second)
+	close(release)
+
+	if err := <-errs; !errors.Is(err, ErrOutage) {
+		t.Errorf("dial that completed during outage error = %v, want ErrOutage", err)
+	}
+	// 撥好的底層連線也要關掉，不能留著
+	peer := <-peers
+	peer.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := peer.Read(make([]byte, 1)); err == nil {
+		t.Error("peer read succeeded, want the dialed connection closed")
+	}
+}
+
 func TestParseOutage(t *testing.T) {
 	cases := []struct {
 		every, length time.Duration
