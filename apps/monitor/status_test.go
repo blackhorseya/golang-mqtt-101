@@ -76,3 +76,18 @@ func TestParseFilters(t *testing.T) {
 		t.Errorf("parseFilters = %q, want %q", got, want)
 	}
 }
+
+func TestFormatAck(t *testing.T) {
+	cases := []struct {
+		ack  mqttx.Ack
+		want string
+	}{
+		{mqttx.Ack{ID: "abc", Command: "reboot", OK: true}, "device-001  ack  command=reboot  id=abc  ok=true"},
+		{mqttx.Ack{ID: "def", Command: "config", Error: "bad interval"}, "device-001  ack  command=config  id=def  ok=false  error=bad interval"},
+	}
+	for _, tc := range cases {
+		if got := formatAck("device-001", tc.ack); got != tc.want {
+			t.Errorf("formatAck(%+v) = %q, want %q", tc.ack, got, tc.want)
+		}
+	}
+}

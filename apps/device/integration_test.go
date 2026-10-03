@@ -415,3 +415,84 @@ func TestIntegrationMonitorSession(t *testing.T) {
 		})
 	}
 }
+
+// ctl 用 ctl binary 對這組的第一台 device 發 command，等它結束後回傳。
+func (x *fleet) ctl(args ...string) *clitest.Process {
+	x.t.Helper()
+	bin := clitest.BuildDir(x.t, "ctl", "../ctl")
+	p := clitest.Start(x.t, bin, append([]string{"--device", x.devices[0], "--timeout", "10s"}, args...)...)
+	p.WaitExit(15 * time.Second)
+	return p
+}
+
+// config 立刻生效並回 ack；參數錯誤也會回 ack，只是 ok=false，ctl 以非零結束。
+func TestIntegrationConfigCommand(t *testing.T) {
+	f := newFleet(t, 1)
+	p := f.start()
+	p.WaitOutput("subscribed to commands", 10*time.Second)
+
+	ok := f.ctl("config", "interval=1s")
+	if code := ok.ExitCode(); code != 0 || !strings.Contains(ok.Output(), "ok=true") {
+		t.Errorf("config interval=1s: exit %d\n%s", code, ok.Output())
+	}
+	p.WaitOutput("interval set to 1s", 5*time.Second)
+
+	bad := f.ctl("config", "interval=fast")
+	if code := bad.ExitCode(); code == 0 || !strings.Contains(bad.Output(), "ok=false") {
+		t.Errorf("config interval=fast: exit %d, want non-zero with ok=false\n%s", code, bad.Output())
+	}
+	p.Signal(os.Interrupt)
+	p.WaitExit(5 * time.Second)
+}
+
+// reboot：device 宣告 offline(reboot) → 斷線 → 等 downtime → 重連（新的 run，seq 從 1 開始）→ 回 ack。
+func TestIntegrationRebootCommand(t *testing.T) {
+	f := newFleet(t, 1)
+	m := f.startMonitor("--topic", "devices/"+f.devices[0]+"/+")
+	p := f.start()
+	m.WaitOutput("seq=3", 10*time.Second)
+
+	c := f.ctl("reboot", "downtime=1s")
+	if code := c.ExitCode(); code != 0 || !strings.Contains(c.Output(), "ok=true") {
+		t.Errorf("reboot: exit %d\n%s", code, c.Output())
+	}
+	// 重開機前後各出現一次 seq=1
+	m.WaitCount("seq=1  ", 2, 10*time.Second)
+	m.WaitOutput("command=reboot", 5*time.Second)
+	p.Signal(os.Interrupt)
+	p.WaitExit(5 * time.Second)
+
+	out := m.Output()
+	if !strings.Contains(out, "status=offline  reason=reboot") {
+		t.Errorf("monitor did not see offline(reboot)\n%s", out)
+	}
+	// graceful 斷線，broker 不會發 LWT
+	if strings.Contains(out, "reason=lwt") {
+		t.Errorf("reboot should not trigger LWT\n%s", out)
+	}
+}
+
+// device 不認得的 command 也要回 ack，告訴發送端失敗原因，而不是讓它等到逾時。
+func TestIntegrationUnknownCommand(t *testing.T) {
+	f := newFleet(t, 1)
+	p := f.start()
+	p.WaitOutput("subscribed to commands", 10*time.Second)
+
+	c := f.ctl("selfdestruct")
+	if code := c.ExitCode(); code == 0 || !strings.Contains(c.Output(), "unknown command") {
+		t.Errorf("selfdestruct: exit %d, want non-zero with unknown command\n%s", code, c.Output())
+	}
+	p.Signal(os.Interrupt)
+	p.WaitExit(5 * time.Second)
+}
+
+// 沒有 device 在線時沒有人會回 ack：ctl 只能等到逾時。
+func TestIntegrationCommandTimeout(t *testing.T) {
+	f := newFleet(t, 1)
+	bin := clitest.BuildDir(t, "ctl", "../ctl")
+	c := clitest.Start(t, bin, "--device", f.devices[0], "--timeout", "1s", "reboot")
+	c.WaitExit(10 * time.Second)
+	if code := c.ExitCode(); code == 0 || !strings.Contains(c.Output(), "timeout") {
+		t.Errorf("exit %d, want non-zero with timeout\n%s", code, c.Output())
+	}
+}
