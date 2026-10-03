@@ -19,6 +19,9 @@ const (
 	defaultRebootDowntime = 3 * time.Second
 )
 
+// 訂閱 command 失敗後隔多久重試。
+var subscribeRetryInterval = time.Second
+
 // received 是收到、等待 device 主迴圈處理的 command。
 type received struct {
 	name string
@@ -27,6 +30,8 @@ type received struct {
 
 // withCommands 讓 device 每次連上都先訂閱自己的 command，再執行原本的 OnConnect（宣告 online）。
 // 先訂閱再宣告 online：看到 online 就發 command 的人，才不會在訂閱生效前送出而遺失。
+// 所以訂閱失敗時不宣告 online，連線還在就重試；連線斷了就放棄，等自動重連後 OnConnect 再被呼叫。
+// （paho 在自己的 goroutine 裡呼叫 OnConnect，在這裡等待與重試不會卡住收訊。）
 //
 // message handler 只把 command 丟進 channel，不在裡面執行：paho 預設依序呼叫 handler，
 // handler 卡住會卡住整個收訊；在 handler 裡等 publish 的確認或呼叫 Disconnect 都可能 deadlock。
@@ -51,12 +56,19 @@ func withCommands(opts *mqtt.ClientOptions, id string, commands chan<- received)
 		}
 	}
 	return opts.SetOnConnectHandler(func(client mqtt.Client) {
-		tok := client.Subscribe(mqttx.CommandFilter(id), commandQoS, handle)
-		if err := mqttx.Wait(context.Background(), tok, brokerTimeout); err != nil {
+		for {
+			tok := client.Subscribe(mqttx.CommandFilter(id), commandQoS, handle)
+			err := mqttx.Wait(context.Background(), tok, brokerTimeout)
+			if err == nil {
+				break
+			}
 			log.Printf("%s: subscribe commands: %v", id, err)
-		} else {
-			log.Printf("%s: subscribed to %s", id, mqttx.CommandFilter(id))
+			if !client.IsConnectionOpen() {
+				return
+			}
+			time.Sleep(subscribeRetryInterval)
 		}
+		log.Printf("%s: subscribed to %s", id, mqttx.CommandFilter(id))
 		if announce != nil {
 			announce(client)
 		}
