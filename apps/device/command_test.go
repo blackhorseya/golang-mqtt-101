@@ -11,8 +11,11 @@ import (
 	"github.com/blackhorseya/golang-mqtt-101/pkg/mqttx"
 )
 
-// doneToken 是已完成的 token，Error 回傳 err。
-type doneToken struct{ err error }
+// doneToken 是已完成的 token，Error 回傳 err；result 是 SUBACK 的結果（和 paho 的 *SubscribeToken 一樣）。
+type doneToken struct {
+	err    error
+	result map[string]byte
+}
 
 func (doneToken) Wait() bool                     { return true }
 func (doneToken) WaitTimeout(time.Duration) bool { return true }
@@ -21,23 +24,29 @@ func (doneToken) Done() <-chan struct{} {
 	close(ch)
 	return ch
 }
-func (x doneToken) Error() error { return x.err }
+func (x doneToken) Error() error            { return x.err }
+func (x doneToken) Result() map[string]byte { return x.result }
 
-// subscribeClient 是只實作 Subscribe 與 IsConnectionOpen 的假 client：前 failures 次訂閱失敗；
-// open 為 false 時表示連線已經斷了。
+// subscribeClient 是只實作 Subscribe 與 IsConnectionOpen 的假 client：前 failures 次訂閱失敗
+// （suback 為 true 時是 broker 回 SUBACK 0x80 拒絕，否則是 token 帶錯誤）；open 為 false 時表示連線已經斷了。
 type subscribeClient struct {
 	mqtt.Client
 	failures int
+	suback   bool
 	calls    int
 	open     bool
 }
 
-func (x *subscribeClient) Subscribe(string, byte, mqtt.MessageHandler) mqtt.Token {
+func (x *subscribeClient) Subscribe(filter string, _ byte, _ mqtt.MessageHandler) mqtt.Token {
 	x.calls++
-	if x.calls <= x.failures {
-		return doneToken{err: errors.New("subscription refused")}
+	switch {
+	case x.calls > x.failures:
+		return doneToken{result: map[string]byte{filter: 1}}
+	case x.suback:
+		return doneToken{result: map[string]byte{filter: 0x80}}
+	default:
+		return doneToken{err: errors.New("connection lost")}
 	}
-	return doneToken{}
 }
 
 func (x *subscribeClient) IsConnectionOpen() bool { return x.open }
@@ -58,6 +67,19 @@ func TestWithCommandsRetriesSubscribeBeforeOnline(t *testing.T) {
 	subscribeRetryInterval = time.Millisecond
 	t.Cleanup(func() { subscribeRetryInterval = time.Second })
 	client := &subscribeClient{failures: 2, open: true}
+	if n := connectWith(client); n != 1 {
+		t.Errorf("announced online %d times, want 1", n)
+	}
+	if client.calls != 3 {
+		t.Errorf("subscribe called %d times, want 3", client.calls)
+	}
+}
+
+// broker 以 SUBACK 0x80 拒絕訂閱時，paho 的 token 沒有錯誤；也必須當成失敗重試，不能宣告 online。
+func TestWithCommandsRetriesRefusedSubscription(t *testing.T) {
+	subscribeRetryInterval = time.Millisecond
+	t.Cleanup(func() { subscribeRetryInterval = time.Second })
+	client := &subscribeClient{failures: 2, suback: true, open: true}
 	if n := connectWith(client); n != 1 {
 		t.Errorf("announced online %d times, want 1", n)
 	}
