@@ -5,6 +5,9 @@
 //	device --qos 2 --dup-rate 0.2        # 20% 的 telemetry 由應用程式再發一次
 //	device --count 10 --clear-retained   # 清除這些 device 留在 broker 上的 retained status
 //	device --qos 1 --outage-every 15s --outage-for 5s   # 每 15 秒斷線 5 秒，觀察重連與補送
+//
+// 每個 device 訂閱 commands/{deviceID}/#，支援 config（interval=…）與 reboot（downtime=…），
+// 執行後把結果發到 devices/{deviceID}/ack。用 ctl 發送：ctl --device device-001 reboot
 package main
 
 import (
@@ -184,18 +187,18 @@ func deviceOptions(cfg mqttx.Config, keepAlive time.Duration, retain bool) *mqtt
 		})
 }
 
-// runDevice 連上 broker 後每隔 interval 發一次 telemetry，直到 c 被取消才正常下線。
+// runDevice 連上 broker 後每隔 interval 發一次 telemetry，並執行收到的 command，直到 c 被取消才正常下線。
 func (s *simulator) runDevice(c context.Context, opts *mqtt.ClientOptions, cfg mqttx.Config) {
 	id := cfg.ClientID
-	client := mqtt.NewClient(opts)
-	if err := mqttx.Connect(c, client); err != nil {
-		log.Printf("%s: %s: %v", id, cfg.BrokerURL, err)
+	commands := make(chan received, 16)
+	opts = withCommands(opts, id, commands)
+	client, ok := connectDevice(c, opts, cfg)
+	if !ok {
 		return
 	}
-	log.Printf("%s: connected to %s", id, cfg.BrokerURL)
 
-	sensor := newSensor(id, s.run, rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())))
 	rng := rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64()))
+	sensor := newSensor(id, s.run, rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())))
 	topic := mqttx.TelemetryTopic(id)
 	published := 0
 
@@ -210,6 +213,41 @@ func (s *simulator) runDevice(c context.Context, opts *mqtt.ClientOptions, cfg m
 			client.Disconnect(250)
 			log.Printf("%s: disconnected, published %d telemetry", id, published)
 			return
+		case r := <-commands:
+			switch r.name {
+			case "config":
+				interval, err := parseInterval(r.cmd.Args)
+				if err == nil {
+					ticker.Reset(interval)
+					log.Printf("%s: interval set to %s", id, interval)
+				}
+				publishAck(c, client, id, r, err)
+			case "reboot":
+				downtime, err := parseDowntime(r.cmd.Args)
+				if err != nil {
+					publishAck(c, client, id, r, err)
+					continue
+				}
+				// 重開機：宣告 offline 後正常斷線（所以不會有 LWT），等一段時間再以新的 client 連上。
+				// 重開後是新的 run，序號從 1 重來 —— 就像 Phase 5 的 device 重啟
+				log.Printf("%s: rebooting, back in %s", id, downtime)
+				publishStatus(c, client, id, mqttx.StateOffline, mqttx.ReasonReboot, s.retain)
+				client.Disconnect(250)
+				select {
+				case <-c.Done():
+					log.Printf("%s: interrupted while rebooting, published %d telemetry", id, published)
+					return
+				case <-time.After(downtime):
+				}
+				if client, ok = connectDevice(c, opts, cfg); !ok {
+					return
+				}
+				sensor = newSensor(id, time.Now().UnixNano(), rand.New(rand.NewPCG(rand.Uint64(), rand.Uint64())))
+				// ack 在重開機完成後才發：發送端等到的是「做完了」，而不只是「收到了」
+				publishAck(c, client, id, r, nil)
+			default:
+				publishAck(c, client, id, r, fmt.Errorf("unknown command %q", r.name))
+			}
 		case now := <-ticker.C:
 			tel := sensor.next(now)
 			if rng.Float64() < s.skipRate {
@@ -234,6 +272,17 @@ func (s *simulator) runDevice(c context.Context, opts *mqtt.ClientOptions, cfg m
 			}
 		}
 	}
+}
+
+// connectDevice 以 opts 建立新的 client 並連上 broker；c 被取消或失敗時回傳 false。
+func connectDevice(c context.Context, opts *mqtt.ClientOptions, cfg mqttx.Config) (mqtt.Client, bool) {
+	client := mqtt.NewClient(opts)
+	if err := mqttx.Connect(c, client); err != nil {
+		log.Printf("%s: %s: %v", cfg.ClientID, cfg.BrokerURL, err)
+		return nil, false
+	}
+	log.Printf("%s: connected to %s", cfg.ClientID, cfg.BrokerURL)
+	return client, true
 }
 
 // publish 發布一則 telemetry 並記錄統計，回傳是否在期限內得到確認。

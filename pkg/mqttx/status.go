@@ -14,13 +14,14 @@ const (
 )
 
 // Reason 說明狀態是怎麼來的。重點是區分兩種 offline：
-// graceful 是 device 自己發的；lwt 是 device 異常斷線後 broker 代發的 Last Will。
+// graceful、reboot 是 device 自己發的；lwt 是 device 異常斷線後 broker 代發的 Last Will。
 type Reason string
 
 const (
 	ReasonConnected Reason = "connected"
 	ReasonGraceful  Reason = "graceful"
 	ReasonLWT       Reason = "lwt"
+	ReasonReboot    Reason = "reboot" // 收到 reboot command，稍後會重連
 )
 
 // Status 是發到 devices/{deviceID}/status 的 payload。

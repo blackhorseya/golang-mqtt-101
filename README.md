@@ -7,6 +7,7 @@
 ```
 apps/device/     device simulator：每個 device 是獨立的 MQTT client
 apps/monitor/    用 wildcard 訂閱 device 訊息並印到 terminal
+apps/ctl/        對 device 發送 command 並等待 ack
 apps/hello/      go.work 範例 app
 pkg/mqttx/       共用 module：設定、topic、telemetry payload、模擬斷線
 deployments/     部署設定（docker/ 內含本機 mosquitto，只綁 127.0.0.1）
@@ -17,10 +18,12 @@ go.work          把以上 module 串成一個 workspace
 
 ```
 devices/{deviceID}/telemetry     device → monitor，量測資料（JSON）
-devices/{deviceID}/status        device 在線狀態：{"state":"online|offline","reason":"connected|graceful|lwt"}
+devices/{deviceID}/status        device 在線狀態：{"state":"online|offline","reason":"connected|graceful|lwt|reboot"}
+devices/{deviceID}/ack           device → ctl，command 的執行結果：{"id":"…","command":"reboot","ok":true}
+commands/{deviceID}/{command}    ctl → device，command：{"id":"…","args":{"interval":"500ms"}}
 ```
 
-後續 phase 會加入 `commands/{deviceID}/{command}`。
+device 訂閱 `commands/{deviceID}/#`。ack 放在 `devices/` 底下而不是 `commands/{deviceID}/` 底下，否則 device 會收到自己發的 ack。
 
 ## 快速開始
 
@@ -72,6 +75,9 @@ device-003  temp=29.2  humidity=64  battery=73  seq=1  qos=0  lat=0.7ms  accepte
 | clean session | `--clean-session`（兩者皆有） | | `true` |
 | 自動重連 backoff 上限 | `--max-reconnect-interval`（兩者皆有） | | `10m` |
 | monitor 的 ClientID | | `MQTT_CLIENT_ID` | `monitor-{pid}` |
+| ctl 的目標 device | `--device`（ctl） | | `device-001` |
+| ctl 等待 ack 的上限 | `--timeout`（ctl） | | `10s` |
+| command 的 QoS | `--qos`（ctl） | | `1` |
 
 ## Phase 1 練習：Pub/Sub 與 wildcard
 
@@ -456,6 +462,141 @@ paho 在**自動重連**時不論 clean session 與否，都會補送 client 端
 差別在 broker：clean session 下 broker 每次連線都丟掉這個 client 的 in-flight 狀態。
 理論上，QoS 2 的訊息剛送出、還沒收到 PUBREC 就斷線，重連後 paho 重送，broker 已經忘了它 —— 可能轉發兩次。
 時機很難湊到，本機沒有觀察到；有興趣可以用很短的 `--outage-every` 搭配 `--qos 2` 長時間跑，看 monitor 有沒有 `duplicate`。
+
+## Phase 7 練習：Command 與 Ack
+
+前面的訊息都是 device → server。這個 phase 反過來：用 `ctl` 對 device 發 command，等 device 回 ack。
+
+```sh
+./bin/ctl --device device-001 config interval=500ms   # 改 telemetry 間隔，立刻生效
+./bin/ctl --device device-001 reboot                  # 假重開機：斷線 → 等 3 秒 → 重連
+./bin/ctl --device device-001 reboot downtime=5s
+```
+
+MQTT 本身沒有「回應」：publish 出去就結束了，publisher 不知道誰收到、結果如何。要做 request/response 得自己來：
+
+1. ctl 訂閱 `devices/{deviceID}/ack`，**等到 SUBACK 才往下走**
+2. ctl 把帶隨機 `id` 的 command 發到 `commands/{deviceID}/{command}`（QoS 1、**不 retained**）
+3. device 執行後把同一個 `id` 放進 ack 發回來
+4. ctl 只認 `id` 相同的 ack（同一個 ack topic 上可能有別人的 command 的回應），或等到逾時
+
+第 1 步的順序很重要：device 回 config 的 ack 只要幾毫秒，如果先發 command 再訂閱，ack 可能在訂閱生效前就到了。
+它不是 retained，broker 不會替還沒訂閱的人留著，ctl 就永遠等不到。
+（MQTT 5 在協定裡加了 response topic 與 correlation data，做的就是這件事；這個 repo 用的 3.1.1 沒有。）
+
+device 端還有一個限制：paho 收到訊息時依序呼叫 handler，handler 卡住整個收訊就卡住。
+所以 handler 只把 command 丟進 channel，由 device 自己的迴圈去執行、發 ack、斷線重連。
+
+**練習 23：config 與 request/response**
+
+```sh
+./bin/monitor
+./bin/device --interval 1s
+./bin/ctl config interval=300ms
+```
+
+```
+device-001  ack  command=config  id=096ff14151b0b7a6  ok=true  rtt=6.1ms
+```
+
+monitor 也會印出同一則 ack（它預設訂閱 `devices/+/ack`），telemetry 從每秒一筆變成每 0.3 秒一筆。
+`rtt` 是 ctl 發出 command 到收到 ack 的時間：command 經 broker 到 device、ack 再經 broker 回來。
+
+**練習 24：失敗也要回 ack**
+
+```sh
+./bin/ctl config interval=0s
+./bin/ctl selfdestruct
+```
+
+```
+device-001  ack  command=config  id=e838a9fc0e2fdd37  ok=false  rtt=1ms  error=parse interval "0s": must be positive
+device-001  ack  command=selfdestruct  id=02951564875ec1ac  ok=false  rtt=7ms  error=unknown command "selfdestruct"
+```
+
+ctl 以非零結束。如果 device 遇到不認得的 command 就默默忽略，發送端只能等到逾時，然後分不出「device 不在」和「device 不會做」。
+
+**練習 25：reboot**
+
+```sh
+./bin/monitor
+./bin/device --interval 1s
+./bin/ctl reboot downtime=2s
+```
+
+```
+device-001  status=offline  reason=reboot  online=0
+device-001  ack  command=reboot  id=5c3c72ba000c0d97  ok=true
+device-001  status=online  reason=connected  online=1
+device-001  temp=...  seq=1  ...  accepted
+```
+
+- 是 `reason=reboot` 不是 `lwt`：device 自己宣告 offline 後正常 DISCONNECT，broker 不會發布 LWT
+- 重開機後是新的 `run`，`seq` 從 1 開始，monitor 照樣 `accepted`（Phase 5 練習 16）
+- ack 在**重連之後**才發，所以 ctl 的 `rtt=2.0161s` 約等於 downtime：ctl 等到的是「做完了」，而不只是「收到了」
+- device 先發 online 再發 ack，monitor 卻可能先印 ack（如上）。MQTT 只保證同一個 topic 上的順序，
+  online（`status`、QoS 0）和 ack（`ack`、QoS 1）是不同 topic，本機實測就出現了顛倒
+
+**練習 26：沒有回應**
+
+```sh
+./bin/ctl --device device-999 --timeout 3s reboot
+```
+
+```
+device-999 reboot 3f2a...: no ack after 3s: timeout
+```
+
+broker 收下 command（QoS 1 的 PUBACK 來自 **broker**，不是 device），但沒有人訂閱，訊息直接消失。
+逾時只代表「沒等到 ack」：可能 device 不在線、command 遺失，也可能 device 執行了但 ack 遺失。
+重試之前要想清楚：reboot 重送一次就是再重開一次。
+
+**練習 27：retained command 的災難**
+
+ctl 刻意不用 retained。用容器裡的 `mosquitto_pub` 發一則 retained 的 reboot 看看：
+
+```sh
+./bin/device --interval 1s
+docker compose -f deployments/docker/docker-compose.yaml exec mosquitto \
+  mosquitto_pub -t commands/device-001/reboot -r -q 1 -m '{"id":"retained-1","args":{"downtime":"1s"}}'
+```
+
+device 開始無限重開機（本機實測 6 秒內 7 次，ack 的 id 每次都是 `retained-1`）：
+每次重連都重新訂閱 `commands/device-001/#`，broker 就把保留的 reboot 再送一次。用空的 retained payload 清掉才停：
+
+```sh
+docker compose -f deployments/docker/docker-compose.yaml exec mosquitto \
+  mosquitto_pub -t commands/device-001/reboot -r -n
+```
+
+（podman 使用者把 `docker compose` 換成 `podman compose`。）
+
+每次的 `id` 都一樣，device 只要記住執行過的 command id 就不會重複執行 —— 又回到 Phase 5 的 idempotency。
+QoS 1 的 command 本來就可能送達兩次，同樣的道理也適用。這個 repo 刻意不做這個去重，留給你想想要記多少個 id、記多久。
+
+**練習 28：device 斷線時發 command**
+
+把 Phase 6 的斷線和 session 搭在一起：
+
+```sh
+./bin/device --interval 1s --outage-every 6s --outage-for 4s --max-reconnect-interval 1s
+./bin/device --interval 1s --outage-every 6s --outage-for 4s --max-reconnect-interval 1s --clean-session=false
+# 在 device 斷線期間（log 出現 connection lost 之後）：
+./bin/ctl --timeout 8s config interval=500ms
+```
+
+| device | command QoS | 結果（本機實測，斷線 4 秒） |
+|--------|-------------|------|
+| clean session | 1 | `timeout`：broker 不記得 device 的訂閱，command 沒人收 |
+| persistent session | 1 | `ok=true  rtt=2.9824s`：broker 替 device 排隊，重連後立刻送達 |
+| persistent session | 0 | `timeout`：broker 不替離線的 client 排 QoS 0 |
+
+persistent session 的 device 重連時，log 裡 `interval set to 500ms` 出現在 `status online` **之前**：
+broker 在 CONNACK 之後就送出排隊的 command，比 device 重新訂閱、宣告 online 都早（Phase 6 練習 22 的同一個現象）。
+
+這種「device 上線就補收離線期間的 command」很實用，但要搭配有效期限：
+一個 3 小時前的 reboot 在 device 回來時才執行，可能已經不是任何人想要的了。
+用完記得以同一個 ClientID 用 clean session 連一次，清掉 broker 上的 session（見練習 22）。
 
 ## 測試
 
