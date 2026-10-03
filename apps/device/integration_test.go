@@ -286,11 +286,12 @@ func TestIntegrationEffectiveQoS(t *testing.T) {
 	}
 }
 
-// startMonitor 啟動 monitor binary，只訂閱這組 device 的 telemetry。
-func (x *fleet) startMonitor() *clitest.Process {
+// startMonitor 啟動 monitor binary，只訂閱這組 device 的 telemetry；args 附加在預設參數之後。
+func (x *fleet) startMonitor(args ...string) *clitest.Process {
 	x.t.Helper()
 	bin := clitest.BuildDir(x.t, "monitor", "../monitor")
-	p := clitest.Start(x.t, bin, "--topic", "devices/"+x.devices[0]+"/telemetry", "--report", "0")
+	base := []string{"--topic", "devices/" + x.devices[0] + "/telemetry", "--report", "0"}
+	p := clitest.Start(x.t, bin, append(base, args...)...)
 	p.WaitOutput("subscribed to", 10*time.Second)
 	return p
 }
@@ -341,5 +342,76 @@ func TestIntegrationRestartedDeviceStartsNewSequence(t *testing.T) {
 
 	if out := m.Output(); strings.Contains(out, "out-of-order") || strings.Contains(out, "duplicate") {
 		t.Errorf("restart was misclassified\n%s", out)
+	}
+}
+
+// outageArgs 讓連線在啟動 1.5 秒後斷 1 秒（只斷一次：測試在下一次之前就結束），
+// 並把重連的 backoff 上限壓低，不然 paho 預設的 backoff 會拖長測試。
+var outageArgs = []string{"--outage-every", "1500ms", "--outage-for", "1s", "--max-reconnect-interval", "500ms"}
+
+// stopAfterReconnect 等 p 的輸出出現 n 次 marker（第 2 次以後代表重連成功），再讓資料多跑一下後中斷 device。
+func stopAfterReconnect(device, waitOn *clitest.Process, marker string) {
+	waitOn.WaitCount(marker, 2, 15*time.Second)
+	time.Sleep(time.Second)
+	device.Signal(os.Interrupt)
+	device.WaitExit(5 * time.Second)
+}
+
+// device 斷線期間 paho 會直接丟掉 QoS 0 的 publish（token 仍回報成功），monitor 依序號看到 gap。
+func TestIntegrationOutageDropsQoS0(t *testing.T) {
+	f := newFleet(t, 1)
+	m := f.startMonitor()
+
+	p := f.start(append([]string{"--qos", "0"}, outageArgs...)...)
+	p.WaitOutput("connection lost", 10*time.Second)
+	stopAfterReconnect(p, p, "status online")
+
+	if out := m.Output(); !strings.Contains(out, "gap(missing=") {
+		t.Errorf("QoS 0 messages published during the outage should be lost\n%s", out)
+	}
+}
+
+// QoS 1 的 publish 在斷線期間存在 client 端，重連後補送：monitor 不會看到 gap（可能看到 duplicate）。
+func TestIntegrationOutageResendsQoS1(t *testing.T) {
+	f := newFleet(t, 1)
+	m := f.startMonitor("--qos", "1")
+
+	p := f.start(append([]string{"--qos", "1"}, outageArgs...)...)
+	p.WaitOutput("connection lost", 10*time.Second)
+	stopAfterReconnect(p, p, "status online")
+
+	out := m.Output()
+	if strings.Contains(out, "gap(missing=") {
+		t.Errorf("QoS 1 messages should be resent after reconnect, not lost\n%s", out)
+	}
+	if !strings.Contains(out, "seq=") {
+		t.Errorf("monitor received no telemetry\n%s", out)
+	}
+}
+
+// subscriber 斷線時：clean session 下 broker 不替它保留訊息，重連後出現 gap；
+// persistent session（--clean-session=false）下 broker 替它排隊 QoS 1 訊息，重連後一次補齊。
+func TestIntegrationMonitorSession(t *testing.T) {
+	cases := []struct {
+		cleanSession string
+		wantGap      bool
+	}{
+		{cleanSession: "true", wantGap: true},
+		{cleanSession: "false", wantGap: false},
+	}
+	for _, tc := range cases {
+		t.Run("clean_session_"+tc.cleanSession, func(t *testing.T) {
+			f := newFleet(t, 1)
+			m := f.startMonitor(append([]string{"--qos", "1", "--clean-session=" + tc.cleanSession}, outageArgs...)...)
+
+			p := f.start("--qos", "1")
+			m.WaitOutput("connection lost", 10*time.Second)
+			stopAfterReconnect(p, m, "subscribed to")
+
+			out := m.Output()
+			if got := strings.Contains(out, "gap(missing="); got != tc.wantGap {
+				t.Errorf("gap = %t, want %t\n%s", got, tc.wantGap, out)
+			}
+		})
 	}
 }

@@ -27,3 +27,15 @@ func TestInvalidQoSExits(t *testing.T) {
 		t.Errorf("output does not explain the valid QoS values:\n%s", out)
 	}
 }
+
+// 中斷時間必須比週期短，否則永遠連不上。
+func TestInvalidOutageExits(t *testing.T) {
+	p := clitest.Start(t, clitest.Build(t, "monitor"), "--outage-every", "2s", "--outage-for", "3s", "--broker", clitest.UnreachableBroker(t))
+	p.WaitExit(3 * time.Second)
+	if code := p.ExitCode(); code == 0 {
+		t.Errorf("exit code = 0, want non-zero\noutput:\n%s", p.Output())
+	}
+	if out := p.Output(); !strings.Contains(out, "must be shorter than outage-every") {
+		t.Errorf("output does not explain the valid outage range:\n%s", out)
+	}
+}
