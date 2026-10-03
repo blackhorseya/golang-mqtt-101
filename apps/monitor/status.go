@@ -62,3 +62,15 @@ func parseFilters(s string) []string {
 	}
 	return filters
 }
+
+// formatAck 把 device 回報的 command 執行結果排成一行，例如：
+//
+//	device-001  ack  command=reboot  id=3f2a…  ok=true
+//	device-001  ack  command=config  id=9c1d…  ok=false  error=parse interval "fast": …
+func formatAck(deviceID string, ack mqttx.Ack) string {
+	line := fmt.Sprintf("%s  ack  command=%s  id=%s  ok=%t", deviceID, ack.Command, ack.ID, ack.OK)
+	if ack.Error != "" {
+		line += "  error=" + ack.Error
+	}
+	return line
+}

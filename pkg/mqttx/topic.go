@@ -9,6 +9,7 @@ import (
 //
 //	devices/{deviceID}/telemetry
 //	devices/{deviceID}/status
+//	devices/{deviceID}/ack
 const devicesRoot = "devices"
 
 // DeviceID 產生模擬 device 的 ID，例如 ("device", 1) → device-001。

@@ -1,6 +1,6 @@
 // monitor 用 wildcard 訂閱所有 device 的訊息並印到 terminal。
 //
-//	monitor                       # 預設訂閱 devices/+/telemetry 與 devices/+/status
+//	monitor                       # 預設訂閱 devices/+/telemetry、devices/+/status 與 devices/+/ack
 //	monitor --topic 'devices/#'   # 試試多層 wildcard
 //	monitor --qos 0               # 以 QoS 0 訂閱：訊息最高只會以 QoS 0 送達
 //	monitor --clean-session=false --outage-every 15s --outage-for 5s   # 斷線期間由 broker 替 monitor 排隊訊息
@@ -26,7 +26,7 @@ import (
 func main() {
 	// 預設 ClientID 帶 pid，讓多個 monitor 可以同時跑而不互踢
 	cfg := mqttx.ConfigFromEnv(fmt.Sprintf("monitor-%d", os.Getpid()))
-	topics := flag.String("topic", "devices/+/telemetry,devices/+/status", "訂閱的 topic filter，多個以逗號分隔（可用 + 與 #）")
+	topics := flag.String("topic", "devices/+/telemetry,devices/+/status,devices/+/ack", "訂閱的 topic filter，多個以逗號分隔（可用 + 與 #）")
 	qosFlag := flag.Int("qos", 2, "訂閱的 QoS 上限（0、1、2）；訊息實際送達的 QoS = min(發布的 QoS, 此值)")
 	report := flag.Duration("report", 5*time.Second, "每隔多久印一次接收統計（0 表示只在結束時印）")
 	outageEvery := flag.Duration("outage-every", 0, "每隔多久模擬一次網路中斷（0 表示不中斷）")
@@ -59,9 +59,10 @@ func main() {
 		// 在 OnConnect 裡訂閱：clean session 下斷線重連後 broker 不會記得舊訂閱，每次連上都要重訂。
 		// persistent session 下 broker 記得訂閱，重訂一次也無妨（同一個 filter 只是覆蓋）
 		SetOnConnectHandler(func(client mqtt.Client) {
+			// broker 拒絕訂閱時 token 沒有錯誤，要看 SUBACK 結果（WaitSubscribe 會檢查）
 			tok := client.SubscribeMultiple(filters, h.handle)
-			if tok.Wait() && tok.Error() != nil {
-				log.Printf("subscribe %s: %v", *topics, tok.Error())
+			if err := mqttx.WaitSubscribe(context.Background(), tok, 10*time.Second); err != nil {
+				log.Printf("subscribe %s: %v", *topics, err)
 				return
 			}
 			log.Printf("subscribed to %s", *topics)
@@ -107,7 +108,7 @@ type handler struct {
 	stats    *receiveStats
 }
 
-// handle 依 topic 印出訊息：telemetry 與 status 以固定格式呈現，其他 topic（例如用 devices/# 訂閱時）印原始內容。
+// handle 依 topic 印出訊息：telemetry、status 與 ack 以固定格式呈現，其他 topic（例如用 devices/# 訂閱時）印原始內容。
 func (h *handler) handle(_ mqtt.Client, m mqtt.Message) {
 	switch {
 	case strings.HasSuffix(m.Topic(), "/telemetry"):
@@ -147,6 +148,18 @@ func (h *handler) handle(_ mqtt.Client, m mqtt.Message) {
 		online := h.presence.apply(id, s)
 		h.mu.Unlock()
 		fmt.Println(formatStatus(id, s, online, m.Retained()))
+	case strings.HasSuffix(m.Topic(), "/ack"):
+		id, err := mqttx.DeviceIDFromTopic(m.Topic())
+		if err != nil {
+			log.Printf("%v", err)
+			return
+		}
+		ack, err := mqttx.DecodeAck(m.Payload())
+		if err != nil {
+			log.Printf("%s: %v", m.Topic(), err)
+			return
+		}
+		fmt.Println(formatAck(id, ack))
 	default:
 		fmt.Printf("%s  %s\n", m.Topic(), m.Payload())
 	}
